@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build artifacts (PyInstaller etc.)
+build/
+dist/
+*.spec
+
+# Generated output
+out/
+
+# Channel metadata (proprietary / user-supplied — kept local, not shared)
+motodata/channel_descriptions.json
+motodata/channel_units_overrides.json
+
+# Local-only config (paths, machine-specific settings)
+local_config.json
+*.local
+
+# AI assistant / Claude artifacts (never publish)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.claude.json
+.cursor/
+.aider*
+.continue/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
