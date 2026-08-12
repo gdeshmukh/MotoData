@@ -19,17 +19,20 @@ and a Ferrari export open through the same reader.
 - **Lap chooser** (`Ctrl+L`) — a Track / Session / Car / Run tree on the left,
   that node's laps as rows on the right with lap time and gap to best, each row
   carrying an **A** and a **B** checkbox so either slot is one click.
-- **Two-lap compare** — lap **A** (red) and lap **B** (green) everywhere. On open
-  it auto-picks the fastest lap vs the next-fastest.
+- **Two-lap compare** — lap **A** (red) and lap **B** (green) on every trace, in
+  the cursor readout and as a dot on the track map. On open it auto-picks the
+  fastest lap vs the next-fastest.
 - **Session metadata** — driver, car number, track, session and date are read
   from the XML WinTAX writes beside each run and shown in the header.
 - **Stacked synced traces** — one panel per channel, X-linked. Left-click or drag
-  moves the cursor; right-drag and the wheel zoom. Adding a channel keeps the
-  zoom you were on.
-- **Delta-time** — when comparing on the distance axis, a Δt panel shows time
-  gained/lost along the lap.
-- **Track map** — the circuit drawn from GPS, with a cursor dot; click the map to
-  jump the graphs to that point on track.
+  moves the cursor; right-drag and the wheel zoom, and zooming out stops at the
+  full lap. Adding a channel keeps the zoom you were on.
+- **Delta-time** — a Δt panel shows time gained/lost along the lap. It only means
+  anything against distance, so the Δ button flips the x-axis to distance when you
+  turn it on, and greys out when there is nothing to compare.
+- **Track map** — the circuit drawn from GPS as one outline, a checkered mark where
+  the lap is cut and a dot per lap at the cursor; click the map to jump the graphs
+  to that point on track.
 - **Channel picker** (`Ctrl+K`) — filter ~700 channels by name *or* description,
   grouped by module; your selection persists as you switch laps.
 - **Time / Distance x-axis**, **focus mode** (hide the side panel), PNG export.
@@ -55,6 +58,10 @@ Or set a default once with the `MOTODATA_ROOT` environment variable.
 **Mouse on the graph** — left-click or drag moves the cursor; right-drag and the
 wheel zoom. **Click the track map** to move the cursor to that point on track.
 
+The window has no title bar: minimise / maximise / close sit at the right-hand end
+of the menu bar, and dragging the empty part of the menu bar moves the window
+(double-click it to maximise).
+
 | Key | Action |
 |-----|--------|
 | `Ctrl+O` | open a data folder |
@@ -65,9 +72,6 @@ wheel zoom. **Click the track map** to move the cursor to that point on track.
 | `h` | reset zoom (auto-range) |
 | `f` | focus mode — hide the side panel |
 | `F11` | full screen |
-
-The **Session** menu switches track / session / car directly, without opening
-the lap chooser.
 
 ## Project layout
 ```

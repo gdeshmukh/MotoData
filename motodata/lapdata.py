@@ -38,6 +38,7 @@ class LapData:
         self._dist_ready = False
         self._gps_raw_data = None
         self._gps_ready = False
+        self._gpsx: dict[str, np.ndarray] = {}
         self._origin = None
         self._proj = None
 
@@ -45,6 +46,7 @@ class LapData:
         self.lap.close()
         self._cache.clear()
         self._xcache.clear()
+        self._gpsx.clear()
 
     # ---- channels ----
     def has(self, name: str) -> bool:
@@ -172,13 +174,20 @@ class LapData:
         return self._proj
 
     def _gps_x(self, mode: str):
+        """GPS sample positions on the x-axis. Cached like x(): the cursor asks for
+        this on every move, and it does not change when the origin moves."""
         p = self._project()
         if p is None:
             return None
-        if mode == "dist" and self.has_distance:
-            dt, dv = self._dist
-            return np.interp(p[0], dt, dv)
-        return p[0]
+        v = self._gpsx.get(mode)
+        if v is None:
+            if mode == "dist" and self.has_distance:
+                dt, dv = self._dist
+                v = np.interp(p[0], dt, dv)
+            else:
+                v = p[0]
+            self._gpsx[mode] = v
+        return v
 
     def gps_track(self):
         p = self._project()

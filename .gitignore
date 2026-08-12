@@ -13,6 +13,9 @@ dist/
 # Generated output
 out/
 
+# Local fixture: two synthetic laps and the smoke harness that drives the window
+examples/
+
 # Channel metadata (proprietary / user-supplied — kept local, not shared)
 motodata/channel_descriptions.json
 motodata/channel_units_overrides.json

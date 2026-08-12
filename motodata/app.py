@@ -5,11 +5,11 @@ cursor readout sit on the right. Laps are chosen in their own window (Ctrl+L).
 Data comes through motodata.reader / .lapdata / .discovery.
 """
 from __future__ import annotations
-import os, sys, json, time
+import os, sys, ctypes, json, time
 import numpy as np
 
 from PyQt6 import QtGui, QtWidgets
-from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 import pyqtgraph as pg
 
 from .catalog import Catalog
@@ -36,16 +36,24 @@ ROLE_CHANNELS = {
 }
 MAX_PANELS = 12
 FRAME_MS = 0.016
+CAPTION_CLICKS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)
+FONT = ("JetBrains Mono", "Cascadia Mono", "Consolas")   # first one installed wins
+FONT_CSS = ",".join(f"'{f}'" for f in FONT)
+DWMWA_BORDER_COLOR = 34
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".motodata")
 CONFIG = os.path.join(STATE_DIR, "config.json")
 HEADER_CACHE = os.path.join(STATE_DIR, "headers.json")
 
 STYLE = f"""
-QWidget {{ background:{PANEL}; color:{INK}; font-family:'Segoe UI'; font-size:12px; }}
+QWidget {{ background:{PANEL}; color:{INK}; font-family:{FONT_CSS};
+           font-size:12px; font-weight:300; }}
 QMainWindow, QSplitter {{ background:{BG}; }}
 QSplitter::handle {{ background:{EDGE}; }}
 QMenuBar {{ background:{BG}; }}
 QMenuBar::item:selected {{ background:#2b3037; }}
+#wbtn, #wclose {{ background:transparent; border:0; border-radius:0; color:{MUTED}; }}
+#wbtn:hover {{ background:#2b3037; color:{INK}; }}
+#wclose:hover {{ background:#c0392b; color:#ffffff; }}
 QMenu {{ background:{PANEL}; border:1px solid {GRID}; }}
 QMenu::item:selected {{ background:#2b3037; }}
 QPushButton {{ background:#22262c; border:1px solid #30353c; padding:3px 9px; border-radius:3px; }}
@@ -62,6 +70,35 @@ QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
 """
 
 pg.setConfigOptions(antialias=False, background=BG, foreground=MUTED)
+
+
+def dark_frame(hwnd):
+    """Pin the DWM window border to the background. Around a captionless window
+    Windows draws it light grey, brightest just after the window is raised again."""
+    c = QtGui.QColor(BG)
+    ref = ctypes.c_int(c.blue() << 16 | c.green() << 8 | c.red())    # COLORREF is 0x00BBGGRR
+    try:
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_BORDER_COLOR, ctypes.byref(ref), ctypes.sizeof(ref))
+    except (AttributeError, OSError):
+        pass                                    # not Windows, or no dwmapi to talk to
+
+
+def sf_symbol(cols=3):
+    """A 2 x cols checkerboard in a unit box: the start/finish mark."""
+    p = QtGui.QPainterPath()
+    for row in range(2):
+        for col in range(row % 2, cols, 2):
+            p.addRect(col / cols - 0.5, row / 2 - 0.5, 1 / cols, 0.5)
+    return p
+
+
+def mono(pt, weight=QtGui.QFont.Weight.Light):
+    f = QtGui.QFont()
+    f.setFamilies(FONT)
+    f.setPointSize(pt)
+    f.setWeight(weight)
+    return f
 
 
 def fmt_val(name, v):
@@ -155,7 +192,9 @@ class Walk(QRunnable):
 class MotoData(QtWidgets.QMainWindow):
     def __init__(self, root=""):
         super().__init__()
-        self.setWindowTitle("MotoData")
+        self.setWindowTitle("MotoData")                 # taskbar only; there is no title bar
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint
+                            | Qt.WindowType.WindowSystemMenuHint)
         self.resize(1600, 950)
         self.setStyleSheet(STYLE)
         self.cat = Catalog()
@@ -226,7 +265,7 @@ class MotoData(QtWidgets.QMainWindow):
         btn = QtWidgets.QPushButton(f"{slot}  --")
         btn.setCheckable(True)
         btn.setChecked(True)
-        btn.setFont(QtGui.QFont("Cascadia Mono", 10, QtGui.QFont.Weight.Bold))
+        btn.setFont(mono(10))
         btn.setStyleSheet(f"QPushButton{{color:{color}; text-align:left;}}")
         btn.setToolTip(f"click to show / hide lap {slot}")
         btn.setMinimumWidth(112)
@@ -254,8 +293,8 @@ class MotoData(QtWidgets.QMainWindow):
         self.delta_btn = QtWidgets.QPushButton("Δ  --")
         self.delta_btn.setCheckable(True)
         self.delta_btn.setChecked(True)
-        self.delta_btn.setFont(QtGui.QFont("Cascadia Mono", 9))
-        self.delta_btn.setToolTip("click to show / hide the delta-time panel")
+        self.delta_btn.setFont(mono(9))
+        self.delta_btn.setToolTip("show / hide the Δt panel (flips the x-axis to distance)")
         self.delta_btn.clicked.connect(self._toggle_dt)
         btns.addWidget(self.delta_btn)
         h.addLayout(btns)
@@ -310,10 +349,10 @@ class MotoData(QtWidgets.QMainWindow):
         self.map.hideAxis("bottom")
         self.map.setMenuEnabled(False)
         self.map.setMinimumHeight(240)
-        self.mapB = self.map.plot(pen=pg.mkPen(B_COLOR, width=1.5))
-        self.mapA = self.map.plot(pen=pg.mkPen(A_COLOR, width=2))     # A drawn over B
-        cache_curve(self.mapA)
-        cache_curve(self.mapB)
+        self.track = self.map.plot(pen=pg.mkPen(MUTED, width=2))
+        cache_curve(self.track)
+        self.sf = pg.ScatterPlotItem(size=13, symbol=sf_symbol(), brush=INK, pen=None)
+        self.map.addItem(self.sf)
         self.dotB = pg.ScatterPlotItem(size=8, brush=B_COLOR, pen=None)
         self.dotA = pg.ScatterPlotItem(size=11, brush=A_COLOR, pen=pg.mkPen(BG))
         self.map.addItem(self.dotB)
@@ -321,7 +360,7 @@ class MotoData(QtWidgets.QMainWindow):
         v.addWidget(self.map, 3)
         v.addWidget(self._h("AT CURSOR"))
         self.cursor_lbl = QtWidgets.QLabel("cursor  --")
-        self.cursor_lbl.setFont(QtGui.QFont("Cascadia Mono", 9))
+        self.cursor_lbl.setFont(mono(9))
         self.cursor_lbl.setStyleSheet(f"color:{MUTED};")
         v.addWidget(self.cursor_lbl)
         self.readout = QtWidgets.QWidget()
@@ -338,15 +377,44 @@ class MotoData(QtWidgets.QMainWindow):
         lab.setStyleSheet(f"color:{MUTED}; letter-spacing:1px; font-size:10px;")
         return lab
 
+    def _win_buttons(self):
+        """Minimise / maximise / close, at the right-hand end of the menu bar."""
+        w = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        for glyph, name, fn in (("—", "wbtn", self.showMinimized),
+                                ("□", "wbtn", self._toggle_max),
+                                ("✕", "wclose", self.close)):
+            b = QtWidgets.QPushButton(glyph)
+            b.setObjectName(name)
+            b.setFixedSize(38, 22)
+            b.clicked.connect(fn)
+            h.addWidget(b)
+        return w
+
+    def eventFilter(self, obj, ev):
+        """Empty menu bar stands in for the title bar: drag moves the window,
+        double-click maximises it."""
+        if (ev.type() in CAPTION_CLICKS and obj is self.menuBar()
+                and ev.button() == Qt.MouseButton.LeftButton
+                and not obj.actionAt(ev.position().toPoint())):
+            if ev.type() == QEvent.Type.MouseButtonDblClick:
+                self._toggle_max()
+            else:
+                self.windowHandle().startSystemMove()
+            return True
+        return super().eventFilter(obj, ev)
+
     def _build_menu(self):
         mb = self.menuBar()
+        mb.setCornerWidget(self._win_buttons(), Qt.Corner.TopRightCorner)
+        mb.installEventFilter(self)
         m = mb.addMenu("&File")
         m.addAction("Open folder…", "Ctrl+O", self.open_folder_dialog)
         m.addAction("Save graph as PNG…", self.save_png)
         m.addSeparator()
         m.addAction("Exit", self.close)
-
-        self.session_menu = mb.addMenu("&Session")
 
         m = mb.addMenu("&Laps")
         m.addAction("Choose laps…", "Ctrl+L", self.show_laps)
@@ -365,28 +433,6 @@ class MotoData(QtWidgets.QMainWindow):
         m.addAction("Reset zoom", "H", self.autorange)
         m.addAction("Focus mode (hide side panels)", "F", self.toggle_focus)
         m.addAction("Full screen", "F11", self._toggle_fullscreen)
-
-    def _fill_session_menu(self):
-        """Track > Session > Car, straight from the folder tree."""
-        self.session_menu.clear()
-        tree = {}
-        for car in self.cars:
-            rel = os.path.relpath(car, self.root).split(os.sep) if self.root else [car]
-            node = tree
-            for part in rel[:-1]:
-                node = node.setdefault(part, {})
-            node[rel[-1]] = car
-
-        def build(menu, node):
-            for key in sorted(node):
-                val = node[key]
-                if isinstance(val, dict):
-                    build(menu.addMenu(key), val)
-                else:
-                    num = discovery.car_number(val)
-                    menu.addAction(f"Car {num}" if num else key,
-                                   lambda _=False, c=val: self.select_car(c))
-        build(self.session_menu, tree)
 
     # ------------------------------------------------------------- config
     def _load_cfg(self):
@@ -442,7 +488,6 @@ class MotoData(QtWidgets.QMainWindow):
         if gen != self._walk_gen:
             return
         self.cars = cars
-        self._fill_session_menu()
         self.laps_win.set_root(self.root)
         if cars:
             self.select_car(next(iter(cars)))
@@ -538,9 +583,12 @@ class MotoData(QtWidgets.QMainWindow):
             self.showB = btn.isChecked()
         self.render()
 
-    def _toggle_dt(self, _checked=False):
+    def _toggle_dt(self):
         self.show_dt = self.delta_btn.isChecked()
-        self.render()
+        if self.show_dt and self.mode != "dist":
+            self.toggle_mode()      # Δt is time gained per metre; only the distance axis shows it
+        else:
+            self.render()
 
     def _swap(self):
         self.lapA, self.lapB = self.lapB, self.lapA
@@ -599,14 +647,9 @@ class MotoData(QtWidgets.QMainWindow):
             btn.setText(f"{slot}  {fmt_time(lap.lap_time) if lap else '--'}")
             btn.setEnabled(lap is not None)
             meta.setText(self._lap_meta_text(lap))
-        if self.lapA and self.lapB and self.lapA.lap_time and self.lapB.lap_time:
-            self.delta_btn.setText(f"Δ {self.lapA.lap_time - self.lapB.lap_time:+.3f}")
-            self.delta_btn.setEnabled(True)
-        else:
-            self.delta_btn.setText("Δ  --")
-            self.delta_btn.setEnabled(False)
-        lap = self.lapA or self.lapB
-        self.setWindowTitle(f"MotoData — {self._lap_meta_text(lap)}" if lap else "MotoData")
+        both = self.lapA and self.lapB and self.lapA.lap_time and self.lapB.lap_time
+        self.delta_btn.setText(f"Δ {self.lapA.lap_time - self.lapB.lap_time:+.3f}"
+                               if both else "Δ  --")
 
     # ----------------------------------------------------------- channels
     def _resolve_defaults(self, lap):
@@ -626,6 +669,14 @@ class MotoData(QtWidgets.QMainWindow):
     def _vis(self):
         return (self.lapA if self.showA else None), (self.lapB if self.showB else None)
 
+    def _ref(self):
+        """The lap the x-axis follows."""
+        a, b = self._vis()
+        return a or b or self.lapA or self.lapB
+
+    def _plots(self):
+        return [pr["plot"] for pr in self.panels.values()] + ([self.dt["plot"]] if self.dt else [])
+
     def _eff_mode(self):
         if self.mode != "dist":
             return "time"
@@ -634,10 +685,10 @@ class MotoData(QtWidgets.QMainWindow):
                 return "time"
         return "dist"
 
-    def _want_dt(self):
+    def _can_dt(self):
+        """Δt needs both laps shown and a distance base for each."""
         a, b = self._vis()
-        return bool(self.show_dt and self._eff_mode() == "dist" and a and b
-                    and a.has_distance and b.has_distance)
+        return bool(a and b and a.has_distance and b.has_distance)
 
     def toggle_mode(self):
         old = self._eff_mode()
@@ -655,14 +706,19 @@ class MotoData(QtWidgets.QMainWindow):
         self._m = self._eff_mode()
         if self.mode == "dist" and self._m == "time":
             self.status.setText("Distance not available for a selected lap — showing time.")
-        new = self._sync_panels(self._want_dt())
+        can = self._can_dt()
+        want = self.show_dt and self._m == "dist" and can
+        self.delta_btn.setEnabled(can)       # live only when it can do something,
+        self.delta_btn.setChecked(want)      # and checked only when the panel is up
+        new = self._sync_panels(want)
         self._refresh()
         if autorange or not self._xset:
             self.autorange()
         else:
+            self._limit_x(self._plots())
             for p in new:
                 p.enableAutoRange(axis="y")
-        self.update_map_tracks()
+        self.update_track()
         self._build_readout()
         self.update_cursor(self.cursor_x)
 
@@ -673,11 +729,11 @@ class MotoData(QtWidgets.QMainWindow):
         add_grid(p)
         ax = p.getAxis("left")
         ax.setWidth(52)
-        ax.setStyle(tickFont=QtGui.QFont("Consolas", 8))
+        ax.setStyle(tickFont=mono(8))
         lbl = pg.TextItem(anchor=(0, 0), color=MUTED)
-        lbl.setFont(QtGui.QFont("Consolas", 8))
+        lbl.setFont(mono(8))
         val = pg.TextItem(anchor=(1, 0))
-        val.setFont(QtGui.QFont("Cascadia Mono", 9))
+        val.setFont(mono(9))
         p.addItem(lbl, ignoreBounds=True)
         p.addItem(val, ignoreBounds=True)
         cA = p.plot()
@@ -700,13 +756,13 @@ class MotoData(QtWidgets.QMainWindow):
         p.getViewBox().setBorder(pg.mkPen(EDGE, width=1))
         add_grid(p)
         p.getAxis("left").setWidth(52)
-        p.getAxis("left").setStyle(tickFont=QtGui.QFont("Consolas", 8))
+        p.getAxis("left").setStyle(tickFont=mono(8))
         p.addLine(y=0, pen=pg.mkPen(GRID, width=1))
         lbl = pg.TextItem(anchor=(0, 0), color=MUTED)
-        lbl.setFont(QtGui.QFont("Consolas", 8))
+        lbl.setFont(mono(8))
         lbl.setText("Δt: B − A [s]   (above 0 = A ahead)")
         val = pg.TextItem(anchor=(1, 0))
-        val.setFont(QtGui.QFont("Cascadia Mono", 9))
+        val.setFont(mono(9))
         p.addItem(lbl, ignoreBounds=True)
         p.addItem(val, ignoreBounds=True)
         self.dtcurve = p.plot(pen=pg.mkPen(INK, width=1.6))
@@ -741,6 +797,8 @@ class MotoData(QtWidgets.QMainWindow):
     def _reflow(self):
         self.glw.clear()
         items = ([self.dt["plot"]] if self.dt else []) + [self.panels[c]["plot"] for c in self.plotted]
+        if items and items[0] is not self.xref:
+            self._xset = False           # new x-link master: its range has never been set
         self.xref = items[0] if items else None
         for r, it in enumerate(items):
             self.glw.addItem(it, row=r, col=0)
@@ -784,29 +842,38 @@ class MotoData(QtWidgets.QMainWindow):
             if ta is not None and tb is not None:
                 self.dtcurve.setData(dg, tb - ta)
 
+    def _limit_x(self, plots):
+        """The lap is the whole x world: zoom and pan stop at 0..xmax."""
+        ref = self._ref()
+        xmax = ref.xmax(self._m) if ref else None
+        for p in plots:
+            p.getViewBox().setLimits(xMin=0, xMax=xmax)
+        return xmax
+
     def autorange(self):
         self._m = self._eff_mode()
-        for pr in self.panels.values():
-            pr["plot"].enableAutoRange(axis="y")
-        if self.dt:
-            self.dt["plot"].enableAutoRange(axis="y")
-        ref = self._vis()[0] or self._vis()[1] or self.lapA or self.lapB
-        if self.xref and ref:
-            self.xref.setXRange(0, ref.xmax(self._m), padding=0)
+        plots = self._plots()
+        for p in plots:
+            p.enableAutoRange(axis="y")
+        xmax = self._limit_x(plots)      # limits before the range, or a stale xMax clips it
+        if self.xref and xmax:
+            self.xref.setXRange(0, xmax, padding=0)
             self._xset = True
 
-    def update_map_tracks(self):
-        a, b = self._vis()
-        for lap, curve in ((a, self.mapA), (b, self.mapB)):
-            g = lap.gps_track() if lap else None
-            if g:
-                curve.setData(g[0], g[1])
-            else:
-                curve.clear()
+    def update_track(self):
+        # both laps ran the same circuit, so a second outline over it is only noise;
+        # the A / B dots carry which lap is where
+        g = next((t for lap in self._vis() if lap and (t := lap.gps_track())), None)
+        if g:
+            self.track.setData(*g)
+            self.sf.setData(g[0][:1], g[1][:1])     # a lap starts where it was cut
+        else:
+            self.track.clear()
+            self.sf.clear()
 
     # ------------------------------------------------------------ cursor
     def _cursor_to(self, x):
-        ref = self._vis()[0] or self._vis()[1] or self.lapA
+        ref = self._ref()
         if not ref:
             return
         x = max(0.0, min(x, ref.xmax(self._m)))
@@ -828,7 +895,7 @@ class MotoData(QtWidgets.QMainWindow):
             self.update_cursor(x)
 
     def _map_cursor_to(self, px, py):
-        ref = self._vis()[0] or self._vis()[1] or self.lapA
+        ref = self._ref()
         if ref:
             xq = ref.nearest_x(px, py, self._m)
             if xq is not None:
@@ -882,14 +949,14 @@ class MotoData(QtWidgets.QMainWindow):
             solo = self.chan_color(ch)
             name = QtWidgets.QLabel(ch)
             name.setStyleSheet(f"color:{solo or MUTED};")
-            name.setFont(QtGui.QFont("Cascadia Mono", 8))
+            name.setFont(mono(8))
             self.read_grid.addWidget(name, r, 0)
             for col, (key, color) in enumerate((("a", solo or A_COLOR),
                                                 ("b", solo or B_COLOR),
                                                 ("d", MUTED)), start=1):
                 lab = QtWidgets.QLabel("")
                 lab.setStyleSheet(f"color:{color};")
-                lab.setFont(QtGui.QFont("Cascadia Mono", 9))
+                lab.setFont(mono(9))
                 lab.setAlignment(Qt.AlignmentFlag.AlignRight)
                 self.read_grid.addWidget(lab, r, col)
                 cells[key] = lab
@@ -904,6 +971,9 @@ class MotoData(QtWidgets.QMainWindow):
         else:
             self.split.setSizes(self.cfg.get("splitter_open") or [250, 1050, 300])
             self._focus = False
+
+    def _toggle_max(self):
+        self.showNormal() if self.isMaximized() else self.showMaximized()
 
     def _toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
@@ -931,6 +1001,10 @@ class MotoData(QtWidgets.QMainWindow):
         finally:
             for o in overlays:
                 o.setVisible(True)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        dark_frame(int(self.winId()))
 
     def closeEvent(self, e):
         if self.scan:
