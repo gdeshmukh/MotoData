@@ -1,28 +1,32 @@
 """app.py -- MotoData PyQt6 + pyqtgraph telemetry viewer.
 
-Open a folder (WinTAX Data root, a session, or a single car), scroll the laps,
-pick two to compare, and read channels against a synced crosshair and a GPS
-track map. Data comes through motodata.reader / .lapdata / .discovery.
+Channels pick on the left, the graph stack fills the middle, the track map and
+cursor readout sit on the right. Laps are chosen in their own window (Ctrl+L).
+Data comes through motodata.reader / .lapdata / .discovery.
 """
 from __future__ import annotations
-import os, sys, json
+import os, sys, json, time
 import numpy as np
 
 from PyQt6 import QtGui, QtWidgets
-from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 import pyqtgraph as pg
 
-from .catalog import Catalog, group as chan_group
+from .catalog import Catalog
 from .lapdata import LapData
+from .pickers import LapPicker, ChannelPicker, Scan, fmt_time
 from . import discovery
 
-# palette
-A_COLOR = "#f0a500"     # lap A (amber)
-B_COLOR = "#2bd4d9"     # lap B (cyan)
+A_COLOR = "#ff3b30"     # lap A (red)
+B_COLOR = "#34d158"     # lap B (green)
 BG, PANEL, GRID = "#101317", "#161a1f", "#262c34"
 INK, MUTED, CROSS = "#c8cdd4", "#7d8894", "#e8ecf1"
+EDGE = "#39424e"        # panel divider
 
-# default stack resolved per-lap by role, so it also works on non-Toyota cars
+# used when only one lap is shown, so channels stay tellable apart
+CHAN_COLORS = ["#37d3d0", "#f2b03d", "#a98bff", "#4d9dff", "#ff77b0", "#9ada5a",
+               "#ff8a3c", "#7ee6a0", "#e0e0e0", "#ffd166", "#8ec7ff", "#c3a6ff"]
+
 ROLE_CHANNELS = {
     "speed":    ["vCar", "CarSpd_vCar", "GPS_CarSpeed"],
     "throttle": ["rPedal", "rThrottle1"],
@@ -31,18 +35,33 @@ ROLE_CHANNELS = {
     "steer":    ["EPS_aSteering", "aSteer"],
 }
 MAX_PANELS = 12
+FRAME_MS = 0.016
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".motodata")
 CONFIG = os.path.join(STATE_DIR, "config.json")
 HEADER_CACHE = os.path.join(STATE_DIR, "headers.json")
 
+STYLE = f"""
+QWidget {{ background:{PANEL}; color:{INK}; font-family:'Segoe UI'; font-size:12px; }}
+QMainWindow, QSplitter {{ background:{BG}; }}
+QSplitter::handle {{ background:{EDGE}; }}
+QMenuBar {{ background:{BG}; }}
+QMenuBar::item:selected {{ background:#2b3037; }}
+QMenu {{ background:{PANEL}; border:1px solid {GRID}; }}
+QMenu::item:selected {{ background:#2b3037; }}
+QPushButton {{ background:#22262c; border:1px solid #30353c; padding:3px 9px; border-radius:3px; }}
+QPushButton:hover {{ background:#2b3037; }}
+QPushButton:checked {{ background:#2f3944; border-color:#4a5563; }}
+QLineEdit {{ background:#0e1114; border:1px solid #2a2f36; padding:4px; border-radius:3px; }}
+QTreeWidget {{ background:#0e1114; border:1px solid #23282f; outline:0; }}
+QHeaderView::section {{ background:#1b2026; border:0; border-right:1px solid {GRID}; padding:4px; }}
+#compbar {{ background:{BG}; border-bottom:1px solid {EDGE}; }}
+QStatusBar {{ background:{BG}; color:{MUTED}; }}
+QScrollBar:vertical {{ background:{PANEL}; width:11px; margin:0; }}
+QScrollBar::handle:vertical {{ background:#2b323a; border-radius:5px; min-height:24px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
+"""
+
 pg.setConfigOptions(antialias=False, background=BG, foreground=MUTED)
-
-
-def fmt_time(s):
-    if s is None or s != s:
-        return "--"
-    m = int(s // 60)
-    return f"{m}:{s - 60 * m:06.3f}" if m else f"{s:.3f}"
 
 
 def fmt_val(name, v):
@@ -51,7 +70,68 @@ def fmt_val(name, v):
     return str(int(round(v))) if "gear" in name.lower() else f"{v:.1f}"
 
 
-# ---- background workers (generation-tagged so stale results are dropped) ----
+def cache_curve(item):
+    """Rasterise a curve once so moving the cursor blits instead of redrawing it."""
+    c = getattr(item, "curve", item)
+    c.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
+
+
+def add_grid(plot):
+    """Cached grid item. The axis-drawn grid (showGrid) is regenerated on every
+    repaint, which costs ~20 ms per cursor move across a stack of panels."""
+    g = pg.GridItem()
+    g.setTextPen(None)
+    g.setZValue(-1000)
+    g.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
+    plot.addItem(g, ignoreBounds=True)
+    return g
+
+
+class CursorViewBox(pg.ViewBox):
+    """Left click/drag moves the cursor; right-drag and wheel still zoom."""
+
+    def __init__(self, on_cursor):
+        super().__init__()
+        self._on_cursor = on_cursor
+
+    def _emit(self, ev):
+        ev.accept()
+        self._on_cursor(self.mapSceneToView(ev.scenePos()).x())
+
+    def mouseDragEvent(self, ev, axis=None):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._emit(ev)
+        else:
+            super().mouseDragEvent(ev, axis)
+
+    def mouseClickEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._emit(ev)
+        else:
+            super().mouseClickEvent(ev)
+
+
+class MapViewBox(pg.ViewBox):
+    """Click/drag on the track map jumps the cursor to that point on track."""
+
+    def __init__(self, on_point):
+        super().__init__()
+        self._on_point = on_point
+        self.setMouseEnabled(False, False)
+        self.setAspectLocked(True)
+
+    def _emit(self, ev):
+        ev.accept()
+        p = self.mapSceneToView(ev.scenePos())
+        self._on_point(p.x(), p.y())
+
+    def mouseDragEvent(self, ev, axis=None):
+        self._emit(ev)
+
+    def mouseClickEvent(self, ev):
+        self._emit(ev)
+
+
 class _WalkSig(QObject):
     result = pyqtSignal(int, object)
 
@@ -60,6 +140,8 @@ class Walk(QRunnable):
     def __init__(self, root, gen):
         super().__init__()
         self.root, self.gen, self.sig = root, gen, _WalkSig()
+        self.finished = False
+        self.setAutoDelete(False)          # Python side must outlive run()
 
     def run(self):
         try:
@@ -67,32 +149,7 @@ class Walk(QRunnable):
         except Exception:
             cars = {}
         self.sig.result.emit(self.gen, cars)
-
-
-class _ScanSig(QObject):
-    lap = pyqtSignal(int, int, object)
-    done = pyqtSignal(int)
-
-
-class Scan(QRunnable):
-    def __init__(self, lap_dirs, cache, gen):
-        super().__init__()
-        self.lap_dirs, self.cache, self.gen = lap_dirs, cache, gen
-        self.sig, self._stop = _ScanSig(), False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        for i, ld in enumerate(self.lap_dirs):
-            if self._stop:
-                return
-            try:
-                lt, mk = discovery.lap_meta(ld, self.cache)
-            except Exception:
-                lt, mk = None, None
-            self.sig.lap.emit(self.gen, i, (lt, mk))
-        self.sig.done.emit(self.gen)
+        self.finished = True
 
 
 class MotoData(QtWidgets.QMainWindow):
@@ -100,33 +157,47 @@ class MotoData(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("MotoData")
         self.resize(1600, 950)
+        self.setStyleSheet(STYLE)
         self.cat = Catalog()
         self.pool = QThreadPool.globalInstance()
         self.hdr_cache = discovery.load_cache(HEADER_CACHE)
+        self.meta_cache = {}
         self.cfg = self._load_cfg()
 
+        self.root = ""
         self.cars = {}
         self.lap_rows = []
         self.scan = None
         self.lapA = self.lapB = None
-        self.active = "A"
-        self.mode = "dist"           # user intent; _m is the effective mode
+        self.showA = self.showB = True
+        self.show_dt = True
+        self.mode = "dist"
         self._m = "dist"
         self.plotted = list(self.cfg.get("plotted") or [])
         self.cursor_x = 0.0
-        self.panels = {}             # ch -> {"plot","cA","cB","vline","lbl","val"}
+        self.panels = {}
         self.dt = None
         self.xref = None
         self._gen = self._walk_gen = 0
-        self._chan_built = False
+        self._jobs = []
         self._auto_done = False
         self._focus = False
         self._xset = False
         self._read_rows = {}
+        self._pending_x = None
+        self._last_move = 0.0
+        self._tick = QTimer(self)
+        self._tick.setSingleShot(True)
+        self._tick.timeout.connect(self._flush_cursor)
+
+        self.laps_win = LapPicker(self.pool, self.hdr_cache, STYLE)
+        self.laps_win.assign.connect(self._assign)
+        self.laps_win.unassign.connect(self._unassign)
+        self.chan_panel = ChannelPicker(self.cat)
+        self.chan_panel.changed.connect(self._set_channels)
 
         self._build_ui()
-        self._apply_style()
-        self._shortcuts()
+        self._build_menu()
 
         start = root or self.cfg.get("last_folder") or os.environ.get("MOTODATA_ROOT", "")
         if start and os.path.isdir(start):
@@ -135,112 +206,97 @@ class MotoData(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- UI
     def _build_ui(self):
         self.split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
+        self.split.setHandleWidth(2)
         self.setCentralWidget(self.split)
-        self.split.addWidget(self._build_left())
+        self.chan_panel.setMinimumWidth(200)
+        self.split.addWidget(self.chan_panel)
         self.split.addWidget(self._build_center())
-        self.split.addWidget(self._build_right())
+        right = self._build_right()
+        right.setMinimumWidth(250)
+        self.split.addWidget(right)
         self.split.setStretchFactor(1, 1)
-        sizes = self.cfg.get("splitter_open") or [300, 1080, 300]
-        if len(sizes) != 3 or (sizes[0] == 0 and sizes[2] == 0):
-            sizes = [300, 1080, 300]
+        sizes = self.cfg.get("splitter_open") or [250, 1050, 300]
+        if len(sizes) != 3 or sizes[1] == 0:
+            sizes = [250, 1050, 300]
         self.split.setSizes(sizes)
         self.status = QtWidgets.QLabel("Open a folder to begin.")
         self.statusBar().addWidget(self.status)
 
-    def _build_left(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(6, 6, 6, 6)
-        v.setSpacing(6)
-        top = QtWidgets.QHBoxLayout()
-        b = QtWidgets.QPushButton("Open folder")
-        b.clicked.connect(self.open_folder_dialog)
-        top.addWidget(b)
-        self.car_combo = QtWidgets.QComboBox()
-        self.car_combo.currentIndexChanged.connect(self._on_car_pick)
-        top.addWidget(self.car_combo, 1)
-        v.addLayout(top)
-        self.path_lbl = QtWidgets.QLabel("")
-        self.path_lbl.setStyleSheet(f"color:{MUTED};")
-        v.addWidget(self.path_lbl)
-
-        inner = QtWidgets.QSplitter(Qt.Orientation.Vertical)
-        v.addWidget(inner, 1)
-        lapbox = QtWidgets.QWidget()
-        lv = QtWidgets.QVBoxLayout(lapbox)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(4)
-        head = QtWidgets.QHBoxLayout()
-        head.addWidget(self._h("LAPS"))
-        head.addStretch(1)
-        self.active_btn = QtWidgets.QPushButton("assign: A")
-        self.active_btn.setToolTip("Which slot a lap click/arrow fills (Tab flips it)")
-        self.active_btn.clicked.connect(self._flip_active)
-        head.addWidget(self.active_btn)
-        lv.addLayout(head)
-        self.lap_list = QtWidgets.QListWidget()
-        self.lap_list.setUniformItemSizes(True)
-        self.lap_list.setFont(QtGui.QFont("Cascadia Mono", 9))
-        self.lap_list.currentRowChanged.connect(self._on_lap_row)
-        lv.addWidget(self.lap_list, 1)
-        inner.addWidget(lapbox)
-
-        chbox = QtWidgets.QWidget()
-        cv = QtWidgets.QVBoxLayout(chbox)
-        cv.setContentsMargins(0, 0, 0, 0)
-        cv.setSpacing(4)
-        cv.addWidget(self._h("CHANNELS"))
-        self.filter = QtWidgets.QLineEdit()
-        self.filter.setPlaceholderText("filter name or description")
-        self.filter.textChanged.connect(self._filter_channels)
-        cv.addWidget(self.filter)
-        self.chan_tree = QtWidgets.QTreeWidget()
-        self.chan_tree.setHeaderHidden(True)
-        self.chan_tree.setFont(QtGui.QFont("Cascadia Mono", 9))
-        self.chan_tree.itemChanged.connect(self._on_chan_toggle)
-        cv.addWidget(self.chan_tree, 1)
-        inner.addWidget(chbox)
-        inner.setSizes([560, 360])
-        return w
+    def _slot_row(self, slot, color, toggle):
+        btn = QtWidgets.QPushButton(f"{slot}  --")
+        btn.setCheckable(True)
+        btn.setChecked(True)
+        btn.setFont(QtGui.QFont("Cascadia Mono", 10, QtGui.QFont.Weight.Bold))
+        btn.setStyleSheet(f"QPushButton{{color:{color}; text-align:left;}}")
+        btn.setToolTip(f"click to show / hide lap {slot}")
+        btn.setMinimumWidth(112)
+        btn.clicked.connect(toggle)
+        meta = QtWidgets.QLabel("")
+        meta.setStyleSheet(f"color:{MUTED};")
+        return btn, meta
 
     def _build_center(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
+
         bar = QtWidgets.QWidget()
         bar.setObjectName("compbar")
         h = QtWidgets.QHBoxLayout(bar)
-        h.setContentsMargins(10, 6, 10, 6)
-        self.slotA = QtWidgets.QLabel("A  --")
-        self.slotB = QtWidgets.QLabel("B  --")
-        for lab, col in ((self.slotA, A_COLOR), (self.slotB, B_COLOR)):
-            lab.setFont(QtGui.QFont("Cascadia Mono", 11, QtGui.QFont.Weight.Bold))
-            lab.setStyleSheet(f"color:{col};")
-        self.delta_lbl = QtWidgets.QLabel("")
-        self.delta_lbl.setFont(QtGui.QFont("Cascadia Mono", 11))
-        h.addWidget(self.slotA)
-        h.addWidget(QtWidgets.QLabel("vs"))
-        h.addWidget(self.slotB)
-        h.addWidget(self.delta_lbl)
-        for text, fn in (("swap", self._swap), ("clear B", self._clear_b)):
-            btn = QtWidgets.QPushButton(text)
-            btn.clicked.connect(fn)
-            h.addWidget(btn)
-        h.addStretch(1)
+        h.setContentsMargins(8, 5, 8, 5)
+        h.setSpacing(10)
+        btns = QtWidgets.QVBoxLayout()
+        btns.setSpacing(3)
+        b = QtWidgets.QPushButton("Laps…")
+        b.clicked.connect(self.show_laps)
+        btns.addWidget(b)
+        self.delta_btn = QtWidgets.QPushButton("Δ  --")
+        self.delta_btn.setCheckable(True)
+        self.delta_btn.setChecked(True)
+        self.delta_btn.setFont(QtGui.QFont("Cascadia Mono", 9))
+        self.delta_btn.setToolTip("click to show / hide the delta-time panel")
+        self.delta_btn.clicked.connect(self._toggle_dt)
+        btns.addWidget(self.delta_btn)
+        h.addLayout(btns)
+
+        slots = QtWidgets.QGridLayout()
+        slots.setHorizontalSpacing(10)
+        slots.setVerticalSpacing(3)
+        self.btnA, self.metaA = self._slot_row("A", A_COLOR, lambda: self._toggle_lap("A"))
+        self.btnB, self.metaB = self._slot_row("B", B_COLOR, lambda: self._toggle_lap("B"))
+        slots.addWidget(self.btnA, 0, 0)
+        slots.addWidget(self.metaA, 0, 1)
+        slots.addWidget(self.btnB, 1, 0)
+        slots.addWidget(self.metaB, 1, 1)
+        slots.setColumnStretch(1, 1)
+        h.addLayout(slots, 1)
+
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(3)
+        top = QtWidgets.QHBoxLayout()
         self.mode_btn = QtWidgets.QPushButton("x: Distance")
         self.mode_btn.clicked.connect(self.toggle_mode)
-        h.addWidget(self.mode_btn)
-        for text, fn in (("reset", self.autorange), ("PNG", self.save_png), ("focus", self.toggle_focus)):
-            btn = QtWidgets.QPushButton(text)
-            btn.clicked.connect(fn)
-            h.addWidget(btn)
+        top.addWidget(self.mode_btn)
+        b = QtWidgets.QPushButton("reset")
+        b.clicked.connect(self.autorange)
+        top.addWidget(b)
+        right.addLayout(top)
+        bot = QtWidgets.QHBoxLayout()
+        b = QtWidgets.QPushButton("focus")
+        b.clicked.connect(self.toggle_focus)
+        bot.addWidget(b)
+        b = QtWidgets.QPushButton("PNG")
+        b.clicked.connect(self.save_png)
+        bot.addWidget(b)
+        right.addLayout(bot)
+        h.addLayout(right)
         v.addWidget(bar)
+
         self.glw = pg.GraphicsLayoutWidget()
-        self.glw.ci.layout.setSpacing(4)
+        self.glw.ci.layout.setSpacing(10)
+        self.glw.ci.layout.setContentsMargins(2, 2, 2, 2)
         v.addWidget(self.glw, 1)
-        self.mproxy = pg.SignalProxy(self.glw.scene().sigMouseMoved,
-                                     rateLimit=60, slot=self._on_graph_move)
         return w
 
     def _build_right(self):
@@ -249,15 +305,15 @@ class MotoData(QtWidgets.QMainWindow):
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(6)
         v.addWidget(self._h("TRACK MAP"))
-        self.map = pg.PlotWidget()
-        self.map.setAspectLocked(True)
+        self.map = pg.PlotWidget(viewBox=MapViewBox(self._map_cursor_to))
         self.map.hideAxis("left")
         self.map.hideAxis("bottom")
         self.map.setMenuEnabled(False)
-        self.map.setMouseEnabled(False, False)
         self.map.setMinimumHeight(240)
         self.mapB = self.map.plot(pen=pg.mkPen(B_COLOR, width=1.5))
         self.mapA = self.map.plot(pen=pg.mkPen(A_COLOR, width=2))     # A drawn over B
+        cache_curve(self.mapA)
+        cache_curve(self.mapB)
         self.dotB = pg.ScatterPlotItem(size=8, brush=B_COLOR, pen=None)
         self.dotA = pg.ScatterPlotItem(size=11, brush=A_COLOR, pen=pg.mkPen(BG))
         self.map.addItem(self.dotB)
@@ -275,8 +331,6 @@ class MotoData(QtWidgets.QMainWindow):
         self.read_grid.setHorizontalSpacing(10)
         v.addWidget(self.readout)
         v.addStretch(1)
-        self.mapproxy = pg.SignalProxy(self.map.scene().sigMouseMoved,
-                                       rateLimit=60, slot=self._on_map_move)
         return w
 
     def _h(self, text):
@@ -284,28 +338,55 @@ class MotoData(QtWidgets.QMainWindow):
         lab.setStyleSheet(f"color:{MUTED}; letter-spacing:1px; font-size:10px;")
         return lab
 
-    def _apply_style(self):
-        self.setStyleSheet(f"""
-            QWidget {{ background:{PANEL}; color:{INK}; font-family:'Segoe UI'; font-size:12px; }}
-            QMainWindow, QSplitter {{ background:{BG}; }}
-            QPushButton {{ background:#22262c; border:1px solid #30353c; padding:3px 9px; border-radius:3px; }}
-            QPushButton:hover {{ background:#2b3037; }}
-            QLineEdit, QComboBox {{ background:#0e1114; border:1px solid #2a2f36; padding:4px; border-radius:3px; }}
-            QListWidget, QTreeWidget {{ background:#0e1114; border:1px solid #23282f; outline:0; }}
-            QListWidget::item {{ padding:2px 4px; }}
-            QListWidget::item:selected {{ background:#2a2f37; color:{INK}; }}
-            #compbar {{ background:{BG}; border-bottom:1px solid {GRID}; }}
-            QStatusBar {{ background:{BG}; color:{MUTED}; }}
-            QScrollBar:vertical {{ background:{PANEL}; width:11px; margin:0; }}
-            QScrollBar::handle:vertical {{ background:#2b323a; border-radius:5px; min-height:24px; }}
-            QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
-        """)
+    def _build_menu(self):
+        mb = self.menuBar()
+        m = mb.addMenu("&File")
+        m.addAction("Open folder…", "Ctrl+O", self.open_folder_dialog)
+        m.addAction("Save graph as PNG…", self.save_png)
+        m.addSeparator()
+        m.addAction("Exit", self.close)
 
-    def _shortcuts(self):
-        for key, fn in (("z", self.toggle_mode), ("h", self.autorange),
-                        ("f", self.toggle_focus), ("Tab", self._flip_active),
-                        ("F11", self._toggle_fullscreen)):
-            QtGui.QShortcut(QtGui.QKeySequence(key), self).activated.connect(fn)
+        self.session_menu = mb.addMenu("&Session")
+
+        m = mb.addMenu("&Laps")
+        m.addAction("Choose laps…", "Ctrl+L", self.show_laps)
+        m.addSeparator()
+        m.addAction("Show / hide lap A", "Ctrl+1", lambda: self._toggle_lap("A", flip=True))
+        m.addAction("Show / hide lap B", "Ctrl+2", lambda: self._toggle_lap("B", flip=True))
+        m.addAction("Swap A / B", "Ctrl+S", self._swap)
+        m.addAction("Clear B", self._clear_b)
+
+        m = mb.addMenu("&Channels")
+        m.addAction("Focus channel filter", "Ctrl+K", self.focus_channels)
+        m.addAction("Clear all", lambda: self._set_channels([]))
+
+        m = mb.addMenu("&View")
+        m.addAction("Time / Distance x-axis", "Z", self.toggle_mode)
+        m.addAction("Reset zoom", "H", self.autorange)
+        m.addAction("Focus mode (hide side panels)", "F", self.toggle_focus)
+        m.addAction("Full screen", "F11", self._toggle_fullscreen)
+
+    def _fill_session_menu(self):
+        """Track > Session > Car, straight from the folder tree."""
+        self.session_menu.clear()
+        tree = {}
+        for car in self.cars:
+            rel = os.path.relpath(car, self.root).split(os.sep) if self.root else [car]
+            node = tree
+            for part in rel[:-1]:
+                node = node.setdefault(part, {})
+            node[rel[-1]] = car
+
+        def build(menu, node):
+            for key in sorted(node):
+                val = node[key]
+                if isinstance(val, dict):
+                    build(menu.addMenu(key), val)
+                else:
+                    num = discovery.car_number(val)
+                    menu.addAction(f"Car {num}" if num else key,
+                                   lambda _=False, c=val: self.select_car(c))
+        build(self.session_menu, tree)
 
     # ------------------------------------------------------------- config
     def _load_cfg(self):
@@ -325,6 +406,23 @@ class MotoData(QtWidgets.QMainWindow):
             pass
 
     # ------------------------------------------------------------ folders
+    def show_laps(self):
+        self.laps_win.set_root(self.root)
+        self.laps_win.show()
+        self.laps_win.raise_()
+        self.laps_win.activateWindow()
+
+    def focus_channels(self):
+        if self.split.sizes()[0] == 0:
+            self.toggle_focus()
+        self.chan_panel.filter.setFocus()
+        self.chan_panel.filter.selectAll()
+
+    def _start(self, job):
+        self._jobs = [j for j in self._jobs if not j.finished]
+        self._jobs.append(job)
+        self.pool.start(job)
+
     def open_folder_dialog(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select a WinTAX data / session / car folder", self.cfg.get("last_folder", ""))
@@ -332,33 +430,24 @@ class MotoData(QtWidgets.QMainWindow):
             self.open_folder(d)
 
     def open_folder(self, root):
+        self.root = root
         self.cfg["last_folder"] = root
-        self.path_lbl.setText(os.path.normpath(root))
         self.status.setText("Scanning folders…")
         self._walk_gen += 1
         w = Walk(root, self._walk_gen)
         w.sig.result.connect(self._on_cars)
-        self.pool.start(w)
+        self._start(w)
 
     def _on_cars(self, gen, cars):
         if gen != self._walk_gen:
             return
         self.cars = cars
-        self.car_combo.blockSignals(True)
-        self.car_combo.clear()
-        for car in cars:
-            self.car_combo.addItem(os.path.basename(car) or car, car)
-        self.car_combo.setCurrentIndex(0 if cars else -1)
-        self.car_combo.blockSignals(False)
+        self._fill_session_menu()
+        self.laps_win.set_root(self.root)
         if cars:
             self.select_car(next(iter(cars)))
         else:
             self.status.setText("No laps found under that folder.")
-
-    def _on_car_pick(self, idx):
-        car = self.car_combo.itemData(idx)
-        if car:
-            self.select_car(car)
 
     def select_car(self, car):
         if self.scan:
@@ -369,78 +458,35 @@ class MotoData(QtWidgets.QMainWindow):
             except TypeError:
                 pass
         self._gen += 1
-        self._chan_built = False
         self._auto_done = False
         laps = self.cars.get(car, [])
-        self.lap_rows = [{"dir": d, "lt": None, "mk": None} for d in laps]
-        self.lap_list.blockSignals(True)
-        self.lap_list.clear()
-        for d in laps:
-            self.lap_list.addItem(os.path.basename(d).replace("Lap_", ""))
-        self.lap_list.blockSignals(False)
+        self.lap_rows = [{"dir": d, "lt": None} for d in laps]
         self.status.setText(f"{len(laps)} laps — reading times…")
+        self.laps_win.show_laps(laps)
         self.scan = Scan(laps, self.hdr_cache, self._gen)
         self.scan.sig.lap.connect(self._on_lap_meta)
         self.scan.sig.done.connect(self._on_scan_done)
-        self.pool.start(self.scan)
+        self._start(self.scan)
 
     def _on_lap_meta(self, gen, i, meta):
-        if gen != self._gen or i >= len(self.lap_rows):
-            return
-        self.lap_rows[i]["lt"], self.lap_rows[i]["mk"] = meta
-        self._relabel_row(i)
-
-    def _relabel_row(self, i):
-        row, item = self.lap_rows[i], self.lap_list.item(i)
-        if not item:
-            return
-        best, d = self._best_time(), ""
-        if best and row["lt"] and row["lt"] > 0:
-            d = "  best" if row["lt"] <= best else f"  {row['lt'] - best:+.2f}"
-        mk = f" {row['mk']}" if row["mk"] and row["mk"] not in ("", "lap") else ""
-        item.setText(f"{fmt_time(row['lt']):>8}{d}{mk}")
-
-    def _best_time(self):
-        ts = [r["lt"] for r in self.lap_rows if r["lt"] and r["lt"] > 0]
-        if ts:                                    # drop pit/out fragments vs the field
-            med = float(np.median(ts))
-            ts = [t for t in ts if t >= 0.5 * med]
-        return min(ts) if ts else None
+        if gen == self._gen and i < len(self.lap_rows):
+            self.lap_rows[i]["lt"] = meta[0]
 
     def _on_scan_done(self, gen):
-        if gen != self._gen:
+        if gen != self._gen or self._auto_done:
             return
-        for i in range(len(self.lap_rows)):
-            self._relabel_row(i)
-        self.status.setText(f"{len(self.lap_rows)} laps")
-        if not self._auto_done:
-            self._auto_done = True
-            self._auto_assign()
-
-    def _auto_assign(self):
+        self._auto_done = True
         ts = [r["lt"] for r in self.lap_rows if r["lt"] and r["lt"] > 0]
         med = float(np.median(ts)) if ts else None
         cand = sorted((r["lt"], r["dir"]) for r in self.lap_rows
                       if r["lt"] and r["lt"] > 0 and (med is None or r["lt"] >= 0.5 * med))
-        self.mode = "dist"
-        self.mode_btn.setText("x: Distance")
+        self.status.setText(f"{len(self.lap_rows)} laps")
         if cand:
             self._assign("A", cand[0][1])
         if len(cand) > 1:
             self._assign("B", cand[1][1])
 
     # --------------------------------------------------------------- laps
-    def _flip_active(self):
-        self.active = "B" if self.active == "A" else "A"
-        self.active_btn.setText(f"assign: {self.active}")
-
-    def _on_lap_row(self, i):
-        if i < 0 or i >= len(self.lap_rows):
-            return
-        shift = QtWidgets.QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
-        slot = ("B" if self.active == "A" else "A") if shift else self.active
-        self._assign(slot, self.lap_rows[i]["dir"])
-
     def _assign(self, slot, lap_dir):
         cur = self.lapA if slot == "A" else self.lapB
         if cur and os.path.dirname(cur.ztx_path) == lap_dir:
@@ -459,34 +505,68 @@ class MotoData(QtWidgets.QMainWindow):
             if self.lapA:
                 self.lapA.close()
             self.lapA = lap
+            self.showA = True
+            self.btnA.setChecked(True)
         else:
             if self.lapB:
                 self.lapB.close()
             self.lapB = lap
-        if not self._chan_built:
-            self._build_channels(lap)
-        self._sync_origin()
-        self._row_colors()
-        self._compare_bar()
+            self.showB = True
+            self.btnB.setChecked(True)
+        if not self.plotted:
+            self.plotted = self._resolve_defaults(lap)
+            self.chan_panel.build(lap.channels, self.plotted)
+        elif not self.chan_panel.tree.topLevelItemCount():
+            self.chan_panel.build(lap.channels, self.plotted)
+        self._after_lap_change()
+
+    def _unassign(self, slot):
+        if slot == "B":
+            self._clear_b()
+        elif self.lapA:
+            self.lapA.close()
+            self.lapA = None
+            self._after_lap_change()
+
+    def _toggle_lap(self, slot, flip=False):
+        btn = self.btnA if slot == "A" else self.btnB
+        if flip:
+            btn.setChecked(not btn.isChecked())
+        if slot == "A":
+            self.showA = btn.isChecked()
+        else:
+            self.showB = btn.isChecked()
+        self.render()
+
+    def _toggle_dt(self, _checked=False):
+        self.show_dt = self.delta_btn.isChecked()
         self.render()
 
     def _swap(self):
         self.lapA, self.lapB = self.lapB, self.lapA
+        self.showA, self.showB = self.showB, self.showA
+        self.btnA.setChecked(self.showA)
+        self.btnB.setChecked(self.showB)
         for lap, lbl in ((self.lapA, "A"), (self.lapB, "B")):
             if lap:
                 lap.label = lbl
-        self._sync_origin()
-        self._row_colors()
-        self._compare_bar()
-        self.render()
+        self._after_lap_change()
 
     def _clear_b(self):
         if self.lapB:
             self.lapB.close()
             self.lapB = None
-        self._row_colors()
+        self._after_lap_change()
+
+    def _after_lap_change(self):
+        self._sync_origin()
         self._compare_bar()
+        self.laps_win.set_slots(self._dir(self.lapA), self._dir(self.lapB))
+        self.chan_panel.sync(self.plotted)
         self.render()
+
+    def _dir(self, lap):
+        return os.path.dirname(lap.ztx_path) if lap else None
 
     def _sync_origin(self):
         ref = self.lapA or self.lapB
@@ -496,32 +576,37 @@ class MotoData(QtWidgets.QMainWindow):
                 if lap:
                     lap.set_origin(*o)
 
-    def _row_colors(self):
-        da = os.path.dirname(self.lapA.ztx_path) if self.lapA else None
-        db = os.path.dirname(self.lapB.ztx_path) if self.lapB else None
-        for i, row in enumerate(self.lap_rows):
-            item = self.lap_list.item(i)
-            if not item:
-                continue
-            if row["dir"] == da:
-                item.setBackground(QtGui.QColor(60, 44, 12))
-                item.setForeground(QtGui.QColor(A_COLOR))
-            elif row["dir"] == db:
-                item.setBackground(QtGui.QColor(12, 46, 50))
-                item.setForeground(QtGui.QColor(B_COLOR))
-            else:
-                item.setBackground(QtGui.QColor(14, 17, 20))
-                item.setForeground(QtGui.QColor(INK))
+    def _lap_meta_text(self, lap):
+        if not lap:
+            return ""
+        d = os.path.dirname(lap.ztx_path)
+        txt = discovery.describe(d, self.meta_cache)
+        st = self.meta_cache.get("start:" + d, False)
+        if st is False:
+            try:
+                from .reader import read_lap_header
+                st = read_lap_header(d).start
+            except Exception:
+                st = None
+            self.meta_cache["start:" + d] = st
+        if st:
+            txt += "  ·  " + time.strftime("%d %b %Y", time.localtime(st))
+        return txt
 
     def _compare_bar(self):
-        self.slotA.setText(f"A  {fmt_time(self.lapA.lap_time) if self.lapA else '--'}")
-        self.slotB.setText(f"B  {fmt_time(self.lapB.lap_time) if self.lapB else '--'}")
+        for lap, btn, meta, slot in ((self.lapA, self.btnA, self.metaA, "A"),
+                                     (self.lapB, self.btnB, self.metaB, "B")):
+            btn.setText(f"{slot}  {fmt_time(lap.lap_time) if lap else '--'}")
+            btn.setEnabled(lap is not None)
+            meta.setText(self._lap_meta_text(lap))
         if self.lapA and self.lapB and self.lapA.lap_time and self.lapB.lap_time:
-            d = self.lapA.lap_time - self.lapB.lap_time
-            self.delta_lbl.setText(f"Δ {d:+.3f}s")
-            self.delta_lbl.setStyleSheet(f"color:{A_COLOR if d < 0 else B_COLOR};")
+            self.delta_btn.setText(f"Δ {self.lapA.lap_time - self.lapB.lap_time:+.3f}")
+            self.delta_btn.setEnabled(True)
         else:
-            self.delta_lbl.setText("")
+            self.delta_btn.setText("Δ  --")
+            self.delta_btn.setEnabled(False)
+        lap = self.lapA or self.lapB
+        self.setWindowTitle(f"MotoData — {self._lap_meta_text(lap)}" if lap else "MotoData")
 
     # ----------------------------------------------------------- channels
     def _resolve_defaults(self, lap):
@@ -533,78 +618,35 @@ class MotoData(QtWidgets.QMainWindow):
                     break
         return out
 
-    def _build_channels(self, lap):
-        self._chan_built = True
-        present = [c for c in self.plotted if lap.has(c)]
-        self.plotted = present or self._resolve_defaults(lap) or self.plotted
-        self.chan_tree.blockSignals(True)
-        self.chan_tree.clear()
-        groups = {}
-        for c in sorted(lap.channels):
-            groups.setdefault(chan_group(c), []).append(c)
-        for g in sorted(groups):
-            parent = QtWidgets.QTreeWidgetItem([g])
-            parent.setForeground(0, QtGui.QColor(MUTED))
-            parent.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            for c in groups[g]:
-                it = QtWidgets.QTreeWidgetItem([c])
-                it.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-                it.setCheckState(0, Qt.CheckState.Checked if c in self.plotted else Qt.CheckState.Unchecked)
-                if self.cat.description(c):
-                    it.setToolTip(0, self.cat.description(c))
-                parent.addChild(it)
-            self.chan_tree.addTopLevelItem(parent)
-            if any(c in self.plotted for c in groups[g]):
-                parent.setExpanded(True)
-        self.chan_tree.blockSignals(False)
-
-    def _on_chan_toggle(self, item, col):
-        c = item.text(0)
-        on = item.checkState(0) == Qt.CheckState.Checked
-        if on and c not in self.plotted:
-            if len(self.plotted) >= MAX_PANELS:
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-                self.status.setText(f"Max {MAX_PANELS} channels.")
-                return
-            self.plotted.append(c)
-        elif not on and c in self.plotted:
-            self.plotted.remove(c)
+    def _set_channels(self, channels):
+        self.plotted = list(channels)[:MAX_PANELS]
         self.render()
 
-    def _filter_channels(self, text):
-        t = text.lower().strip()
-        for i in range(self.chan_tree.topLevelItemCount()):
-            p = self.chan_tree.topLevelItem(i)
-            shown = 0
-            for j in range(p.childCount()):
-                ch = p.child(j)
-                match = (not t) or t in ch.text(0).lower() or t in self.cat.description(ch.text(0)).lower()
-                ch.setHidden(not match)
-                shown += match
-            p.setHidden(shown == 0)
-            if t and shown:
-                p.setExpanded(True)
-
     # -------------------------------------------------------------- plots
+    def _vis(self):
+        return (self.lapA if self.showA else None), (self.lapB if self.showB else None)
+
     def _eff_mode(self):
         if self.mode != "dist":
             return "time"
-        if self.lapA and not self.lapA.has_distance:
-            return "time"
-        if self.lapB and not self.lapB.has_distance:
-            return "time"
+        for lap in self._vis():
+            if lap and not lap.has_distance:
+                return "time"
         return "dist"
 
     def _want_dt(self):
-        return (self._eff_mode() == "dist" and self.lapA and self.lapB
-                and self.lapA.has_distance and self.lapB.has_distance)
+        a, b = self._vis()
+        return bool(self.show_dt and self._eff_mode() == "dist" and a and b
+                    and a.has_distance and b.has_distance)
 
     def toggle_mode(self):
         old = self._eff_mode()
         self.mode = "time" if self.mode == "dist" else "dist"
         new = self._eff_mode()
-        if self.lapA and old != new and self.cursor_x:
-            self.cursor_x = self.lapA.to_dist(self.cursor_x) if new == "dist" else self.lapA.to_time(self.cursor_x)
+        ref = self.lapA or self.lapB
+        if ref and old != new and self.cursor_x:
+            self.cursor_x = (ref.to_dist(self.cursor_x) if new == "dist"
+                             else ref.to_time(self.cursor_x))
         self.mode_btn.setText(f"x: {'Distance' if self.mode == 'dist' else 'Time'}")
         self._xset = False
         self.render(autorange=True)
@@ -625,24 +667,27 @@ class MotoData(QtWidgets.QMainWindow):
         self.update_cursor(self.cursor_x)
 
     def _make_panel(self, ch):
-        p = pg.PlotItem()
+        p = pg.PlotItem(viewBox=CursorViewBox(self._cursor_to))
         p.setMenuEnabled(False)
-        p.showGrid(x=True, y=True, alpha=0.12)
-        p.setClipToView(True)
-        p.setDownsampling(auto=True, mode="peak")
+        p.getViewBox().setBorder(pg.mkPen(EDGE, width=1))
+        add_grid(p)
         ax = p.getAxis("left")
         ax.setWidth(52)
         ax.setStyle(tickFont=QtGui.QFont("Consolas", 8))
-        u = self.cat.unit(ch)[0]
         lbl = pg.TextItem(anchor=(0, 0), color=MUTED)
         lbl.setFont(QtGui.QFont("Consolas", 8))
-        lbl.setText(f"{ch} [{u}]" if u else ch)
         val = pg.TextItem(anchor=(1, 0))
         val.setFont(QtGui.QFont("Cascadia Mono", 9))
         p.addItem(lbl, ignoreBounds=True)
         p.addItem(val, ignoreBounds=True)
-        cA = p.plot(pen=pg.mkPen(A_COLOR, width=1.6))
-        cB = p.plot(pen=pg.mkPen(B_COLOR, width=1.2, style=Qt.PenStyle.DashLine))
+        cA = p.plot()
+        cB = p.plot()
+        for c in (cA, cB):
+            # must be set on the curve: PlotItem.setDownsampling does not reach
+            # items added later, and full-resolution repaints make dragging crawl
+            c.setDownsampling(auto=True, method="peak")
+            c.setClipToView(True)
+            cache_curve(c)
         vline = pg.InfiniteLine(angle=90, movable=False,
                                 pen=pg.mkPen(CROSS, width=1, style=Qt.PenStyle.DashLine))
         p.addItem(vline, ignoreBounds=True)
@@ -650,9 +695,10 @@ class MotoData(QtWidgets.QMainWindow):
         return {"ch": ch, "plot": p, "cA": cA, "cB": cB, "vline": vline, "lbl": lbl, "val": val}
 
     def _make_dt(self):
-        p = pg.PlotItem()
+        p = pg.PlotItem(viewBox=CursorViewBox(self._cursor_to))
         p.setMenuEnabled(False)
-        p.showGrid(x=True, y=True, alpha=0.12)
+        p.getViewBox().setBorder(pg.mkPen(EDGE, width=1))
+        add_grid(p)
         p.getAxis("left").setWidth(52)
         p.getAxis("left").setStyle(tickFont=QtGui.QFont("Consolas", 8))
         p.addLine(y=0, pen=pg.mkPen(GRID, width=1))
@@ -706,21 +752,35 @@ class MotoData(QtWidgets.QMainWindow):
             items[-1].setLabel("bottom", "Distance" if self._m == "dist" else "Time",
                                units="m" if self._m == "dist" else "s")
 
+    def chan_color(self, ch):
+        """Per-channel colour when a single lap is shown, else the lap's colour."""
+        a, b = self._vis()
+        if a and b:
+            return None
+        i = self.plotted.index(ch) if ch in self.plotted else 0
+        return CHAN_COLORS[i % len(CHAN_COLORS)]
+
     def _refresh(self):
         m = self._m
+        a, b = self._vis()
         for ch, pr in self.panels.items():
-            if self.lapA and self.lapA.has(ch):
-                pr["cA"].setData(*self.lapA.xy(ch, m))
-            else:
-                pr["cA"].clear()
-            if self.lapB and self.lapB.has(ch):
-                pr["cB"].setData(*self.lapB.xy(ch, m))
-            else:
-                pr["cB"].clear()
-        if self.dt and self.lapA and self.lapB:
-            dmax = min(self.lapA.dist_max(), self.lapB.dist_max())
+            solo = self.chan_color(ch)
+            u = self.cat.unit(ch)[0]
+            pr["lbl"].setText(f"{ch} [{u}]" if u else ch)
+            pr["lbl"].setColor(solo or MUTED)
+            for lap, curve, base, dash in ((a, pr["cA"], A_COLOR, False),
+                                           (b, pr["cB"], B_COLOR, True)):
+                if lap and lap.has(ch):
+                    col = solo or base
+                    style = Qt.PenStyle.DashLine if (dash and not solo) else Qt.PenStyle.SolidLine
+                    curve.setPen(pg.mkPen(col, width=1.6 if not dash else 1.3, style=style))
+                    curve.setData(*lap.xy(ch, m))
+                else:
+                    curve.clear()
+        if self.dt and a and b:
+            dmax = min(a.dist_max(), b.dist_max())
             dg = np.linspace(0, dmax, 600)
-            ta, tb = self.lapA.t_of_distance(dg), self.lapB.t_of_distance(dg)
+            ta, tb = a.t_of_distance(dg), b.t_of_distance(dg)
             if ta is not None and tb is not None:
                 self.dtcurve.setData(dg, tb - ta)
 
@@ -730,13 +790,14 @@ class MotoData(QtWidgets.QMainWindow):
             pr["plot"].enableAutoRange(axis="y")
         if self.dt:
             self.dt["plot"].enableAutoRange(axis="y")
-        if self.xref and self.lapA:
-            self.xref.setXRange(0, self.lapA.xmax(self._m), padding=0)
+        ref = self._vis()[0] or self._vis()[1] or self.lapA or self.lapB
+        if self.xref and ref:
+            self.xref.setXRange(0, ref.xmax(self._m), padding=0)
             self._xset = True
 
-    # -------------------------------------------------------------- map
     def update_map_tracks(self):
-        for lap, curve in ((self.lapA, self.mapA), (self.lapB, self.mapB)):
+        a, b = self._vis()
+        for lap, curve in ((a, self.mapA), (b, self.mapB)):
             g = lap.gps_track() if lap else None
             if g:
                 curve.setData(g[0], g[1])
@@ -744,28 +805,38 @@ class MotoData(QtWidgets.QMainWindow):
                 curve.clear()
 
     # ------------------------------------------------------------ cursor
-    def _on_graph_move(self, evt):
-        if not self.xref or not self.lapA:
+    def _cursor_to(self, x):
+        ref = self._vis()[0] or self._vis()[1] or self.lapA
+        if not ref:
             return
-        pos = evt[0]
-        if not self.glw.sceneBoundingRect().contains(pos):
-            return
-        x = self.xref.getViewBox().mapSceneToView(pos).x()
-        self.update_cursor(max(0.0, min(x, self.lapA.xmax(self._m))))
+        x = max(0.0, min(x, ref.xmax(self._m)))
+        # coalesce: a drag fires far more often than the stack can repaint
+        now = time.perf_counter()
+        if now - self._last_move >= FRAME_MS:
+            self._last_move = now
+            self._pending_x = None
+            self.update_cursor(x)
+        else:
+            self._pending_x = x
+            if not self._tick.isActive():
+                self._tick.start(8)
 
-    def _on_map_move(self, evt):
-        if not self.lapA:
-            return
-        pos = evt[0]
-        if not self.map.sceneBoundingRect().contains(pos):
-            return
-        pt = self.map.getViewBox().mapSceneToView(pos)
-        xq = self.lapA.nearest_x(pt.x(), pt.y(), self._m)
-        if xq is not None:
-            self.update_cursor(xq)
+    def _flush_cursor(self):
+        if self._pending_x is not None:
+            x, self._pending_x = self._pending_x, None
+            self._last_move = time.perf_counter()
+            self.update_cursor(x)
+
+    def _map_cursor_to(self, px, py):
+        ref = self._vis()[0] or self._vis()[1] or self.lapA
+        if ref:
+            xq = ref.nearest_x(px, py, self._m)
+            if xq is not None:
+                self._cursor_to(xq)
 
     def update_cursor(self, x):
         self.cursor_x = x
+        a, b = self._vis()
         for pr in self.panels.values():
             pr["vline"].setPos(x)
         if self.dt:
@@ -775,26 +846,30 @@ class MotoData(QtWidgets.QMainWindow):
             pr = self.panels.get(ch)
             if not pr:
                 continue
-            va = self.lapA.value_at(ch, x, self._m) if self.lapA else None
-            vb = self.lapB.value_at(ch, x, self._m) if self.lapB else None
-            txt = f"<span style='color:{A_COLOR}'>{fmt_val(ch, va)}</span>"
-            if self.lapB:
-                txt += f"  <span style='color:{B_COLOR}'>{fmt_val(ch, vb)}</span>"
-            pr["val"].setHtml(txt)
+            va = a.value_at(ch, x, self._m) if a else None
+            vb = b.value_at(ch, x, self._m) if b else None
+            solo = self.chan_color(ch)
+            if solo:
+                v = va if a else vb
+                pr["val"].setText(fmt_val(ch, v), color=solo)
+            else:
+                pr["val"].setHtml(f"<span style='color:{A_COLOR}'>{fmt_val(ch, va)}</span>"
+                                  f"  <span style='color:{B_COLOR}'>{fmt_val(ch, vb)}</span>")
             r = self._read_rows.get(ch)
             if r:
-                r["a"].setText(fmt_val(ch, va))
-                r["b"].setText(fmt_val(ch, vb) if self.lapB else "")
+                r["a"].setText(fmt_val(ch, va) if a else "")
+                r["b"].setText(fmt_val(ch, vb) if b else "")
                 r["d"].setText(f"{va - vb:+.1f}" if (va is not None and vb is not None) else "")
-        for lap, dot in ((self.lapA, self.dotA), (self.lapB, self.dotB)):
+        for lap, dot in ((a, self.dotA), (b, self.dotB)):
             p = lap.gps_point(x, self._m) if lap else None
             dot.setData([p[0]], [p[1]]) if p else dot.setData([], [])
-        if self.dt and self.lapA and self.lapB:
-            ta = self.lapA.t_of_distance(np.array([x], float))
-            tb = self.lapB.t_of_distance(np.array([x], float))
+        if self.dt and a and b:
+            ta = a.t_of_distance(np.array([x], float))
+            tb = b.t_of_distance(np.array([x], float))
             if ta is not None and tb is not None:
                 d = float((tb - ta)[0])
-                self.dt["val"].setHtml(f"<span style='color:{A_COLOR if d >= 0 else B_COLOR}'>{d:+.3f} s</span>")
+                self.dt["val"].setHtml(
+                    f"<span style='color:{A_COLOR if d >= 0 else B_COLOR}'>{d:+.3f} s</span>")
 
     def _build_readout(self):
         while self.read_grid.count():
@@ -804,11 +879,14 @@ class MotoData(QtWidgets.QMainWindow):
         self._read_rows = {}
         for r, ch in enumerate(self.plotted):
             cells = {}
+            solo = self.chan_color(ch)
             name = QtWidgets.QLabel(ch)
-            name.setStyleSheet(f"color:{MUTED};")
+            name.setStyleSheet(f"color:{solo or MUTED};")
             name.setFont(QtGui.QFont("Cascadia Mono", 8))
             self.read_grid.addWidget(name, r, 0)
-            for col, (key, color) in enumerate((("a", A_COLOR), ("b", B_COLOR), ("d", MUTED)), start=1):
+            for col, (key, color) in enumerate((("a", solo or A_COLOR),
+                                                ("b", solo or B_COLOR),
+                                                ("d", MUTED)), start=1):
                 lab = QtWidgets.QLabel("")
                 lab.setStyleSheet(f"color:{color};")
                 lab.setFont(QtGui.QFont("Cascadia Mono", 9))
@@ -824,7 +902,7 @@ class MotoData(QtWidgets.QMainWindow):
             self.split.setSizes([0, sum(self.split.sizes()), 0])
             self._focus = True
         else:
-            self.split.setSizes(self.cfg.get("splitter_open") or [300, 1080, 300])
+            self.split.setSizes(self.cfg.get("splitter_open") or [250, 1050, 300])
             self._focus = False
 
     def _toggle_fullscreen(self):
@@ -838,7 +916,8 @@ class MotoData(QtWidgets.QMainWindow):
             return
         if not f.lower().endswith(".png"):
             f += ".png"
-        overlays = [pr["vline"] for pr in self.panels.values()] + [pr["val"] for pr in self.panels.values()]
+        overlays = ([pr["vline"] for pr in self.panels.values()]
+                    + [pr["val"] for pr in self.panels.values()])
         if self.dt:
             overlays += [self.dtline, self.dt["val"]]
         for o in overlays:
@@ -856,6 +935,7 @@ class MotoData(QtWidgets.QMainWindow):
     def closeEvent(self, e):
         if self.scan:
             self.scan.stop()
+        self.laps_win.close()
         self._save_cfg()
         discovery.save_cache(HEADER_CACHE, dict(self.hdr_cache))
         for lap in (self.lapA, self.lapB):
