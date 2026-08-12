@@ -15,18 +15,24 @@ and a Ferrari export open through the same reader.
 ## Features
 - **Point at a folder** — a WinTAX `Data` root, a session, or a single car
   folder. Laps are discovered automatically; the last folder is remembered.
-- **Two-lap compare** — lap **A** (amber) and lap **B** (cyan) everywhere. On
-  open it auto-picks the fastest lap vs the next-fastest; step through laps with
-  the arrow keys, `Shift`-click to set the other slot, or swap/clear.
-- **Stacked synced traces** — one panel per channel, X-linked, with a crosshair
-  that follows the mouse and live values per channel. Fast pan/zoom (pyqtgraph).
+  Scanning the whole 4,700-lap root takes well under a second.
+- **Lap chooser** (`Ctrl+L`) — a Track / Session / Car / Run tree on the left,
+  that node's laps as rows on the right with lap time and gap to best, each row
+  carrying an **A** and a **B** checkbox so either slot is one click.
+- **Two-lap compare** — lap **A** (red) and lap **B** (green) everywhere. On open
+  it auto-picks the fastest lap vs the next-fastest.
+- **Session metadata** — driver, car number, track, session and date are read
+  from the XML WinTAX writes beside each run and shown in the header.
+- **Stacked synced traces** — one panel per channel, X-linked. Left-click or drag
+  moves the cursor; right-drag and the wheel zoom. Adding a channel keeps the
+  zoom you were on.
 - **Delta-time** — when comparing on the distance axis, a Δt panel shows time
   gained/lost along the lap.
-- **Track map** — the circuit drawn from GPS, with a cursor dot; hover the map to
-  jump the graphs to that point on track (and vice-versa).
-- **Channel picker** — filter ~700 channels by name *or* description, grouped by
-  module; your selection persists as you switch laps.
-- **Time / Distance x-axis**, **focus mode** (hide side panels), PNG export.
+- **Track map** — the circuit drawn from GPS, with a cursor dot; click the map to
+  jump the graphs to that point on track.
+- **Channel picker** (`Ctrl+K`) — filter ~700 channels by name *or* description,
+  grouped by module; your selection persists as you switch laps.
+- **Time / Distance x-axis**, **focus mode** (hide the side panel), PNG export.
 
 ## Requirements
 - Python 3.10+
@@ -46,20 +52,22 @@ python -m venv .venv
 Or set a default once with the `MOTODATA_ROOT` environment variable.
 
 ## Controls
-**Mouse on the graph** — hover moves the crosshair; left-drag pans; wheel zooms;
-right-drag scales. **Hover the track map** to move the crosshair to that spot.
+**Mouse on the graph** — left-click or drag moves the cursor; right-drag and the
+wheel zoom. **Click the track map** to move the cursor to that point on track.
 
 | Key | Action |
 |-----|--------|
+| `Ctrl+O` | open a data folder |
+| `Ctrl+L` | choose laps |
+| `Ctrl+K` | select channels |
+| `Ctrl+S` | swap A / B |
 | `z` | toggle Time / Distance x-axis |
 | `h` | reset zoom (auto-range) |
-| `f` | focus mode — hide the side panels |
+| `f` | focus mode — hide the side panel |
 | `F11` | full screen |
-| `Tab` | flip which slot (A/B) a lap click fills |
-| `←` / `→` | step the active lap through the list |
 
-Click a lap to load it into the active slot; `Shift`-click to load it into the
-other slot.
+The **Session** menu switches track / session / car directly, without opening
+the lap chooser.
 
 ## Project layout
 ```
@@ -67,10 +75,11 @@ MotoData/
 ├── viewer.py                 # launcher (python viewer.py [folder])
 ├── requirements.txt
 └── motodata/
-    ├── app.py                # the PyQt6 + pyqtgraph GUI
+    ├── app.py                # main window: graph stack, track map, menus
+    ├── pickers.py            # lap chooser (tree + A/B rows) and channel chooser
     ├── reader.py             # session-file parser (.ztx / .sar -> numpy)
     ├── lapdata.py            # per-lap analysis (time/distance x, GPS, delta-t)
-    ├── discovery.py          # folder scan + lap-header cache
+    ├── discovery.py          # folder scan, session metadata, lap-header cache
     └── catalog.py            # unit inference + channel descriptions
 ```
 
