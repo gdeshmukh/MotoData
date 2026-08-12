@@ -5,7 +5,7 @@ cursor readout sit on the right. Laps are chosen in their own window (Ctrl+L).
 Data comes through motodata.reader / .lapdata / .discovery.
 """
 from __future__ import annotations
-import os, sys, json, time
+import os, sys, ctypes, json, time
 import numpy as np
 
 from PyQt6 import QtGui, QtWidgets
@@ -39,6 +39,7 @@ FRAME_MS = 0.016
 CAPTION_CLICKS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)
 FONT = ("JetBrains Mono", "Cascadia Mono", "Consolas")   # first one installed wins
 FONT_CSS = ",".join(f"'{f}'" for f in FONT)
+DWMWA_BORDER_COLOR = 34
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".motodata")
 CONFIG = os.path.join(STATE_DIR, "config.json")
 HEADER_CACHE = os.path.join(STATE_DIR, "headers.json")
@@ -69,6 +70,27 @@ QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
 """
 
 pg.setConfigOptions(antialias=False, background=BG, foreground=MUTED)
+
+
+def dark_frame(hwnd):
+    """Pin the DWM window border to the background. Around a captionless window
+    Windows draws it light grey, brightest just after the window is raised again."""
+    c = QtGui.QColor(BG)
+    ref = ctypes.c_int(c.blue() << 16 | c.green() << 8 | c.red())    # COLORREF is 0x00BBGGRR
+    try:
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_BORDER_COLOR, ctypes.byref(ref), ctypes.sizeof(ref))
+    except (AttributeError, OSError):
+        pass                                    # not Windows, or no dwmapi to talk to
+
+
+def sf_symbol(cols=3):
+    """A 2 x cols checkerboard in a unit box: the start/finish mark."""
+    p = QtGui.QPainterPath()
+    for row in range(2):
+        for col in range(row % 2, cols, 2):
+            p.addRect(col / cols - 0.5, row / 2 - 0.5, 1 / cols, 0.5)
+    return p
 
 
 def mono(pt, weight=QtGui.QFont.Weight.Light):
@@ -329,6 +351,8 @@ class MotoData(QtWidgets.QMainWindow):
         self.map.setMinimumHeight(240)
         self.track = self.map.plot(pen=pg.mkPen(MUTED, width=2))
         cache_curve(self.track)
+        self.sf = pg.ScatterPlotItem(size=13, symbol=sf_symbol(), brush=INK, pen=None)
+        self.map.addItem(self.sf)
         self.dotB = pg.ScatterPlotItem(size=8, brush=B_COLOR, pen=None)
         self.dotA = pg.ScatterPlotItem(size=11, brush=A_COLOR, pen=pg.mkPen(BG))
         self.map.addItem(self.dotB)
@@ -840,7 +864,12 @@ class MotoData(QtWidgets.QMainWindow):
         # both laps ran the same circuit, so a second outline over it is only noise;
         # the A / B dots carry which lap is where
         g = next((t for lap in self._vis() if lap and (t := lap.gps_track())), None)
-        self.track.setData(*g) if g else self.track.clear()
+        if g:
+            self.track.setData(*g)
+            self.sf.setData(g[0][:1], g[1][:1])     # a lap starts where it was cut
+        else:
+            self.track.clear()
+            self.sf.clear()
 
     # ------------------------------------------------------------ cursor
     def _cursor_to(self, x):
@@ -972,6 +1001,10 @@ class MotoData(QtWidgets.QMainWindow):
         finally:
             for o in overlays:
                 o.setVisible(True)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        dark_frame(int(self.winId()))
 
     def closeEvent(self, e):
         if self.scan:

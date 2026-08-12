@@ -30,8 +30,9 @@ and a Ferrari export open through the same reader.
 - **Delta-time** — a Δt panel shows time gained/lost along the lap. It only means
   anything against distance, so the Δ button flips the x-axis to distance when you
   turn it on, and greys out when there is nothing to compare.
-- **Track map** — the circuit drawn from GPS as one outline, with a dot per lap at
-  the cursor; click the map to jump the graphs to that point on track.
+- **Track map** — the circuit drawn from GPS as one outline, a checkered mark where
+  the lap is cut and a dot per lap at the cursor; click the map to jump the graphs
+  to that point on track.
 - **Channel picker** (`Ctrl+K`) — filter ~700 channels by name *or* description,
   grouped by module; your selection persists as you switch laps.
 - **Time / Distance x-axis**, **focus mode** (hide the side panel), PNG export.
