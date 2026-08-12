@@ -46,6 +46,7 @@ class LapInfo:
     run: str | None
     lap: str | None
     distance: str | None
+    start: int | None = None       # lap start, unix epoch seconds (unambiguous)
 
     @property
     def is_flying(self):
@@ -64,9 +65,15 @@ def read_lap_header(lap_dir: str) -> LapInfo:
     ztx = os.path.join(lap_dir, "FlashData.ztx")
     if not os.path.exists(ztx):
         ztx = os.path.join(lap_dir, "cableData.ztx")
+    # STS is epoch seconds; the textual dates disagree on day/month order between
+    # LapHeader.xml (DD/MM) and RunLapHeader.xml (MM/DD), so never parse those.
+    try:
+        start = int(_field(txt, "STS"))
+    except (TypeError, ValueError):
+        start = None
     return LapInfo(lap_dir, ztx, lt, _field(txt, "Marker"),
                    _field(txt, "Run"), _field(txt, "Lap"),
-                   _field(txt, "LapDistance"))
+                   _field(txt, "LapDistance"), start)
 
 
 def find_laps(car_dir: str) -> list[LapInfo]:

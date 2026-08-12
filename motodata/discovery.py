@@ -6,10 +6,11 @@ leaves by car. Lap times/markers are parsed on demand via `lap_meta`, backed by
 an mtime-keyed cache so re-opening a car is instant.
 """
 from __future__ import annotations
-import os, json
+import os, re, json
 from .reader import read_lap_header
 
 ZTX_NAMES = ("FlashData.ztx", "cableData.ztx")
+_CAR_NUM = re.compile(r"_(\d{1,3})_")
 
 
 def ztx_in(path: str):
@@ -25,8 +26,10 @@ def is_lap_leaf(path: str) -> bool:
 
 
 def subdirs(path: str) -> list[str]:
+    # Alias_ dirs are raw acquisition copies: no Run level, no .ztx, no Car.xml.
     try:
-        ds = [e.path for e in os.scandir(path) if e.is_dir()]
+        ds = [e.path for e in os.scandir(path)
+              if e.is_dir() and not e.name.startswith("Alias_")]
     except OSError:
         return []
     ds.sort(key=lambda p: os.path.basename(p).lower())
@@ -61,6 +64,52 @@ def group_by_car(lap_dirs: list[str]) -> dict[str, list[str]]:
     for laps in cars.values():
         laps.sort()
     return cars
+
+
+# ---- session metadata (Car.xml / Session.xml next to the laps) ----
+def _xml(path: str) -> str:
+    try:
+        return open(path, "rb").read().decode("latin-1", "replace")
+    except OSError:
+        return ""
+
+
+def _tag(txt: str, tag: str) -> str:
+    m = re.search(r"<%s>(.*?)</%s>" % (tag, tag), txt, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def car_number(path: str) -> str:
+    m = _CAR_NUM.search(os.path.basename(path))
+    return m.group(1) if m else ""
+
+
+def run_info(run_dir: str, cache: dict | None = None) -> dict:
+    """Driver, car and session names from the XML WinTAX writes beside each run."""
+    if cache is not None and run_dir in cache:
+        return cache[run_dir]
+    car, ses = _xml(os.path.join(run_dir, "Car.xml")), _xml(os.path.join(run_dir, "Session.xml"))
+    info = {"driver": _tag(car, "DriverName"), "car": _tag(car, "Name"),
+            "session": _tag(ses, "Name"), "track": _tag(ses, "Track"),
+            "number": car_number(_tag(car, "Name") or run_dir)}
+    if cache is not None:
+        cache[run_dir] = info
+    return info
+
+
+def lap_info(lap_dir: str, cache: dict | None = None) -> dict:
+    """run_info for the run this lap belongs to."""
+    return run_info(os.path.dirname(lap_dir), cache)
+
+
+def describe(lap_dir: str, cache: dict | None = None) -> str:
+    i = lap_info(lap_dir, cache)
+    parts = [i["track"], i["session"]]
+    if i["number"]:
+        parts.append("Car " + i["number"])
+    if i["driver"]:
+        parts.append(i["driver"])
+    return "  ·  ".join(p for p in parts if p)
 
 
 # ---- header cache (mtime-keyed) ----
