@@ -99,7 +99,15 @@ def infer_unit_from(name: str, desc: str | None):
     return None, "none"
 
 
+def group(name: str) -> str:
+    """Channel group, taken from the name's module prefix (data-derived, so it
+    works for any car). Bare names with no prefix fall in 'General'."""
+    return name.split("_", 1)[0] if "_" in name else "General"
+
+
 class Catalog:
+    group = staticmethod(group)
+
     def __init__(self):
         self.desc = {}
         if os.path.exists(DESC_FILE):

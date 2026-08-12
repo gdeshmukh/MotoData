@@ -21,17 +21,4 @@ motodata/channel_units_overrides.json
 local_config.json
 *.local
 
-# AI assistant / Claude artifacts (never publish)
-.claude/
-CLAUDE.md
-CLAUDE.local.md
-.claude.json
-.cursor/
-.aider*
-.continue/
 
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db

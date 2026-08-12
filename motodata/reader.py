@@ -20,7 +20,7 @@ Layout (no extra tools needed):
   strict XML parser.
 """
 from __future__ import annotations
-import os, re, glob, zipfile, array
+import os, re, glob, zipfile
 from dataclasses import dataclass
 import numpy as np
 
@@ -73,15 +73,30 @@ def find_laps(car_dir: str) -> list[LapInfo]:
     laps = []
     for hdr in glob.glob(os.path.join(car_dir, "Run_*", "Lap_*", "LapHeader.xml")):
         laps.append(read_lap_header(os.path.dirname(hdr)))
-    laps.sort(key=lambda l: l.lap_time)
+    laps.sort(key=lambda l: l.lap_time if l.lap_time == l.lap_time else float("inf"))
     return laps
 
 
+def _moved(info: LapInfo, min_kmh: float = 30.0) -> bool:
+    """True if the car actually drove this lap (drops stationary pit/garage fragments)."""
+    if not info.ztx or not os.path.exists(info.ztx):
+        return False
+    try:
+        with Lap(info.ztx, info.lap_time) as lap:
+            if "vCar" not in lap.channels():
+                return True                       # can't check; don't exclude
+            return float(np.median(lap.raw("vCar"))) > min_kmh
+    except Exception:
+        return False
+
+
 def fastest_flying_lap(car_dir: str) -> LapInfo:
-    laps = [l for l in find_laps(car_dir) if l.is_flying and l.lap_time > 0]
-    if not laps:
-        raise ValueError("no flying laps under " + car_dir)
-    return laps[0]
+    # find_laps is sorted ascending; verify candidates top-down so a short
+    # in/out or pit fragment can't masquerade as the fastest lap.
+    for info in find_laps(car_dir):
+        if info.is_flying and info.lap_time > 0 and _moved(info):
+            return info
+    raise ValueError("no flying laps under " + car_dir)
 
 
 class Lap:
@@ -97,6 +112,15 @@ class Lap:
         self._sizes = {i.filename[:-4]: i.file_size
                        for i in self.zip.infolist() if i.filename.endswith(".sar")}
 
+    def close(self):
+        self.zip.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     def channels(self) -> list[str]:
         return sorted(self._sizes)
 
@@ -104,17 +128,20 @@ class Lap:
         return self._sizes[name] // 8
 
     def rate(self, name: str) -> float:
-        """Exact (un-snapped) sample rate in Hz."""
-        return self.n_samples(name) / self.lap_time
+        """Exact (un-snapped) sample rate in Hz; nan if lap_time is unusable."""
+        lt = self.lap_time
+        if not lt or lt != lt or lt <= 0:
+            return float("nan")
+        return self.n_samples(name) / lt
 
     def rate_snapped(self, name: str) -> float:
         r = self.rate(name)
+        if r != r or r <= 0:
+            return 1.0                       # unknown rate: avoid div-by-zero downstream
         return min(STD_RATES, key=lambda s: abs(s - r))
 
     def raw(self, name: str) -> np.ndarray:
-        a = array.array("d")
-        a.frombytes(self.zip.read(name + ".sar"))
-        return np.frombuffer(a, dtype=np.float64).copy()
+        return np.frombuffer(self.zip.read(name + ".sar"), dtype="<f8").copy()
 
     def channel(self, name: str):
         """Return (time_s, values) with the gear offset applied for nGear."""
