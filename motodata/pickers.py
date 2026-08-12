@@ -7,7 +7,7 @@ and a B checkbox so either slot can be filled in one click.
 from __future__ import annotations
 import os, time
 
-from PyQt6 import QtGui, QtWidgets
+from PyQt6 import QtWidgets
 from PyQt6.QtCore import Qt, QObject, QRunnable, pyqtSignal
 
 from . import discovery
@@ -87,7 +87,6 @@ class LapPicker(QtWidgets.QWidget):
         self.table.setHeaderLabels(["Lap", "Time", "vs best", "", "A", "B"])
         self.table.setRootIsDecorated(False)
         self.table.setUniformRowHeights(True)
-        self.table.setFont(QtGui.QFont("Cascadia Mono", 9))
         for col, wdt in ((COL_LAP, 90), (COL_TIME, 90), (COL_DELTA, 80),
                          (COL_MARK, 60), (COL_A, 40), (COL_B, 40)):
             self.table.setColumnWidth(col, wdt)
@@ -263,7 +262,6 @@ class ChannelPicker(QtWidgets.QWidget):
         v.addWidget(self.filter)
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.setFont(QtGui.QFont("Cascadia Mono", 9))
         self.tree.itemChanged.connect(self._toggled)
         self.tree.currentItemChanged.connect(lambda cur, _p: self._describe(cur))
         v.addWidget(self.tree, 1)
