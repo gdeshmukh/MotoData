@@ -39,7 +39,7 @@ FRAME_MS = 0.016
 CAPTION_CLICKS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)
 FONT = ("JetBrains Mono", "Cascadia Mono", "Consolas")   # first one installed wins
 FONT_CSS = ",".join(f"'{f}'" for f in FONT)
-DWMWA_BORDER_COLOR = 34
+DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE = 34, 0xFFFFFFFE
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".motodata")
 CONFIG = os.path.join(STATE_DIR, "config.json")
 HEADER_CACHE = os.path.join(STATE_DIR, "headers.json")
@@ -72,11 +72,12 @@ QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
 pg.setConfigOptions(antialias=False, background=BG, foreground=MUTED)
 
 
-def dark_frame(hwnd):
-    """Pin the DWM window border to the background. Around a captionless window
-    Windows draws it light grey, brightest just after the window is raised again."""
-    c = QtGui.QColor(BG)
-    ref = ctypes.c_int(c.blue() << 16 | c.green() << 8 | c.red())    # COLORREF is 0x00BBGGRR
+def no_frame_border(hwnd):
+    """Drop the DWM border stroke. Around a captionless window Windows draws it light
+    grey, and COLOR_NONE removes it outright - colouring it BG still left a stroke that
+    the accent-colour setting can repaint. Re-applied whenever the window is activated,
+    which is when raising it over another app used to flash the border white."""
+    ref = ctypes.c_uint(DWMWA_COLOR_NONE)
     try:
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd, DWMWA_BORDER_COLOR, ctypes.byref(ref), ctypes.sizeof(ref))
@@ -1004,7 +1005,12 @@ class MotoData(QtWidgets.QMainWindow):
 
     def showEvent(self, e):
         super().showEvent(e)
-        dark_frame(int(self.winId()))
+        no_frame_border(int(self.winId()))
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.ActivationChange:
+            no_frame_border(int(self.winId()))
 
     def closeEvent(self, e):
         if self.scan:
