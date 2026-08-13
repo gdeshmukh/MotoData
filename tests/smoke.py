@@ -35,7 +35,8 @@ checks = {
     "start/finish mark on the lap cut": (len(win.sf.getData()[0]) == 1
                                          and win.sf.getData()[0][0] == win.track.getData()[0][0]),
     "delta button hides the panel": win.dt is None,
-    "font resolves to a mono family": "mono" in QtGui.QFontInfo(A.mono(9)).family().lower(),
+    # not a name match: the third fallback is Consolas, which has no "mono" in it
+    "font resolves to a mono family": QtGui.QFontInfo(A.mono(9)).fixedPitch(),
     "no session menu": not [m for m in win.menuBar().findChildren(QtWidgets.QMenu)
                             if m.title() == "&Session"],
 }
