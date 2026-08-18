@@ -5,52 +5,107 @@ the left, the laps of the selected node as rows on the right, each row with an A
 and a B checkbox so either slot can be filled in one click.
 """
 from __future__ import annotations
-import os, time
+
+import math
+import os
+import threading
+from statistics import median
 
 from PyQt6 import QtWidgets
 from PyQt6.QtCore import Qt, QObject, QRunnable, pyqtSignal
 
 from . import discovery
 from .catalog import group as chan_group
+from .reader import is_flying_marker, lap_moved
 
 COL_LAP, COL_TIME, COL_DELTA, COL_MARK, COL_A, COL_B = range(6)
 LAP_CAP = 400
 
 
 class _ScanSig(QObject):
-    lap = pyqtSignal(int, int, object)
-    done = pyqtSignal(int)
+    lap = pyqtSignal(int, str, object)
+    done = pyqtSignal(int, object)
+
+
+def _known_distance(row):
+    value = row.get("dist")
+    return value is not None and math.isfinite(value) and value > 0
+
+
+def lap_candidates(rows):
+    timed = [r for r in rows if r["lt"] is not None and math.isfinite(r["lt"])
+             and r["lt"] > 0 and is_flying_marker(r.get("mk"))]
+    if not timed:
+        return []
+    measured = [r for r in timed if _known_distance(r)]
+    fallback = timed
+    measured.sort(key=lambda r: r["dist"])
+    while len(measured) >= 2 and measured[-1]["dist"] > 1.25 * measured[-2]["dist"]:
+        top_speed = measured[-1]["dist"] / measured[-1]["lt"]
+        usual_speed = median(r["dist"] / r["lt"] for r in measured[:-1])
+        if 0.7 * usual_speed <= top_speed <= 1.3 * usual_speed:
+            break
+        if len(measured) == 2:
+            fallback = measured + [r for r in timed if not _known_distance(r)]
+            measured = []
+        else:
+            measured.pop()
+    if measured:
+        distance = measured[-1]["dist"]
+        complete = [r for r in measured if 0.8 * distance <= r["dist"] <= 1.2 * distance]
+        typical_time = median(r["lt"] for r in complete)
+        missing = [r for r in timed if not _known_distance(r)
+                   and r["lt"] >= 0.8 * typical_time]
+        timed = complete + missing
+    else:
+        longest = max(r["lt"] for r in fallback)
+        timed = [r for r in fallback if r["lt"] >= 0.8 * longest]
+    return sorted(timed, key=lambda r: r["lt"])
 
 
 class Scan(QRunnable):
     """Parse lap headers off the UI thread; gen tags stale results for dropping."""
 
-    def __init__(self, lap_dirs, cache, gen):
+    def __init__(self, lap_dirs, cache, gen, auto_count=0):
         super().__init__()
-        self.lap_dirs, self.cache, self.gen = lap_dirs, cache, gen
-        self.sig, self._stop = _ScanSig(), False
+        self.lap_dirs, self.cache, self.gen = list(lap_dirs), cache, gen
+        self.auto_count = auto_count
+        self.sig, self._stop = _ScanSig(), threading.Event()
         self.finished = False
         self.setAutoDelete(False)
 
     def stop(self):
-        self._stop = True
+        self._stop.set()
 
     def run(self):
-        for i, ld in enumerate(self.lap_dirs):
-            if self._stop:
-                break
-            try:
-                lt, mk = discovery.lap_meta(ld, self.cache)
-            except Exception:
-                lt, mk = None, None
-            self.sig.lap.emit(self.gen, i, (lt, mk))
-        if not self._stop:
-            self.sig.done.emit(self.gen)
-        self.finished = True
+        rows = []
+        try:
+            for ld in self.lap_dirs:
+                if self._stop.is_set():
+                    return
+                try:
+                    lt, mk, dist = discovery.lap_header_meta(ld, self.cache)
+                except (OSError, TypeError, ValueError):
+                    lt, mk, dist = None, None, None
+                row = {"dir": ld, "lt": lt, "mk": mk, "dist": dist}
+                rows.append(row)
+                self.sig.lap.emit(self.gen, ld, (lt, mk, dist))
+            selected = []
+            if self.auto_count:
+                for row in lap_candidates(rows):
+                    if self._stop.is_set() or len(selected) >= self.auto_count:
+                        break
+                    ztx = discovery.ztx_in(row["dir"])
+                    if lap_moved(ztx, row["lt"], lap_distance=row["dist"]):
+                        selected.append(row["dir"])
+            if not self._stop.is_set():
+                self.sig.done.emit(self.gen, selected)
+        finally:
+            self.finished = True
 
 
 def fmt_time(s):
-    if s is None or s != s:
+    if s is None or not math.isfinite(s):
         return "--"
     m = int(s // 60)
     return f"{m}:{s - 60 * m:06.3f}" if m else f"{s:.3f}"
@@ -59,16 +114,16 @@ def fmt_time(s):
 class LapPicker(QtWidgets.QWidget):
     assign = pyqtSignal(str, str)      # slot ("A"/"B"), lap dir
     unassign = pyqtSignal(str)
+    laps_requested = pyqtSignal(object, bool)
 
-    def __init__(self, pool, hdr_cache, style=""):
+    def __init__(self, style=""):
         super().__init__()
         self.setWindowTitle("Choose laps")
         self.resize(1000, 640)
         self.setStyleSheet(style)
-        self.pool, self.hdr_cache = pool, hdr_cache
         self.meta_cache = {}
-        self.rows, self.scan, self._gen = [], None, 0
-        self._jobs = []
+        self.rows, self._row_index = [], {}
+        self._lap_index = []
         self._guard = False
         self.root = ""
         self._slot_a = self._slot_b = None
@@ -108,8 +163,11 @@ class LapPicker(QtWidgets.QWidget):
         lay.addLayout(bar)
 
     # ---- tree ----
-    def set_root(self, root):
-        if root == self.root:
+    def set_index(self, lap_dirs):
+        self._lap_index = list(lap_dirs)
+
+    def set_root(self, root, refresh=False):
+        if root == self.root and not refresh:
             return
         self.root = root
         self.tree.blockSignals(True)         # filling the tree must not pick a node
@@ -139,23 +197,17 @@ class LapPicker(QtWidgets.QWidget):
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if not path:
             return
-        laps = discovery.find_lap_dirs(path, cap=LAP_CAP + 1)
+        norm = os.path.normcase(os.path.abspath(path)).rstrip("\\/")
+        prefix = norm + os.sep
+        laps = [d for d in self._lap_index
+                if (key := os.path.normcase(os.path.abspath(d))) == norm or key.startswith(prefix)]
         extra = len(laps) > LAP_CAP
-        self.show_laps(laps[:LAP_CAP])
-        if extra:
-            self.status.setText(f"showing first {LAP_CAP} laps — open a car or run to narrow")
+        self.laps_requested.emit(laps[:LAP_CAP], extra)
 
     # ---- lap table ----
-    def show_laps(self, lap_dirs):
-        if self.scan:
-            self.scan.stop()
-            try:
-                self.scan.sig.lap.disconnect()
-                self.scan.sig.done.disconnect()
-            except TypeError:
-                pass
-        self._gen += 1
-        self.rows = [{"dir": d, "lt": None, "mk": None} for d in lap_dirs]
+    def set_laps(self, lap_dirs):
+        self.rows = [{"dir": d, "lt": None, "mk": None, "dist": None} for d in lap_dirs]
+        self._row_index = {d: i for i, d in enumerate(lap_dirs)}
         self._guard = True
         self.table.clear()
         for d in lap_dirs:
@@ -168,46 +220,39 @@ class LapPicker(QtWidgets.QWidget):
         self._guard = False
         self._apply_slots()
         self.info.setText(discovery.describe(lap_dirs[0], self.meta_cache) if lap_dirs else "")
-        self.status.setText(f"{len(lap_dirs)} laps — reading times…")
-        self.scan = Scan(lap_dirs, self.hdr_cache, self._gen)
-        self.scan.sig.lap.connect(self._meta)
-        self.scan.sig.done.connect(self._scan_done)
-        self._jobs = [j for j in self._jobs if not j.finished] + [self.scan]
-        self.pool.start(self.scan)
+        self.status.setText(f"{len(lap_dirs)} laps" + (" — reading times…" if lap_dirs else ""))
 
-    def _meta(self, gen, i, meta):
-        if gen != self._gen or i >= len(self.rows):
+    def set_meta(self, lap_dir, meta):
+        i = self._row_index.get(lap_dir)
+        if i is None:
             return
-        self.rows[i]["lt"], self.rows[i]["mk"] = meta
+        self.rows[i]["lt"], self.rows[i]["mk"], self.rows[i]["dist"] = meta
         self._relabel(i)
 
     def _best(self):
-        ts = [r["lt"] for r in self.rows if r["lt"] and r["lt"] > 0]
-        if not ts:
-            return None
-        med = sorted(ts)[len(ts) // 2]
-        real = [t for t in ts if t >= 0.5 * med]
-        return min(real) if real else None
+        rows = lap_candidates(self.rows)
+        return rows[0]["lt"] if rows else None
 
-    def _relabel(self, i):
+    def _relabel(self, i, best=None):
         it = self.table.topLevelItem(i)
         if not it:
             return
         r = self.rows[i]
-        best = self._best()
         self._guard = True
         it.setText(COL_TIME, fmt_time(r["lt"]))
-        if best and r["lt"] and r["lt"] > 0:
+        it.setText(COL_DELTA, "")
+        if (best and r["lt"] and r["lt"] >= best
+                and is_flying_marker(r["mk"])):
             it.setText(COL_DELTA, "best" if r["lt"] <= best else f"+{r['lt'] - best:.2f}")
         it.setText(COL_MARK, r["mk"] or "")
         self._guard = False
 
-    def _scan_done(self, gen):
-        if gen != self._gen:
-            return
+    def scan_finished(self, extra=False):
+        best = self._best()
         for i in range(len(self.rows)):
-            self._relabel(i)
-        self.status.setText(f"{len(self.rows)} laps")
+            self._relabel(i, best)
+        text = f"showing first {LAP_CAP} laps — narrow the selection" if extra else f"{len(self.rows)} laps"
+        self.status.setText(text)
 
     def _toggled(self, item, col):
         if self._guard or col not in (COL_A, COL_B):
@@ -246,12 +291,13 @@ class LapPicker(QtWidgets.QWidget):
 class ChannelPicker(QtWidgets.QWidget):
     changed = pyqtSignal(list)
 
-    def __init__(self, catalog, style=""):
+    def __init__(self, catalog, style="", limit=12):
         super().__init__()
         self.setWindowTitle("Select channels")
         self.resize(420, 720)
         self.setStyleSheet(style)
         self.cat = catalog
+        self.limit = limit
         self.plotted = []
         self._guard = False
 
@@ -274,6 +320,7 @@ class ChannelPicker(QtWidgets.QWidget):
         self.plotted = list(plotted)
         self._guard = True
         self.tree.clear()
+        self.desc.clear()
         groups = {}
         for c in sorted(channels):
             groups.setdefault(chan_group(c), []).append(c)
@@ -290,19 +337,27 @@ class ChannelPicker(QtWidgets.QWidget):
             if any(c in self.plotted for c in groups[g]):
                 parent.setExpanded(True)
         self._guard = False
+        self._filter(self.filter.text())
 
     def _describe(self, item):
         if item is None or item.childCount():
             return
         c = item.text(0)
         u = self.cat.unit(c)[0]
-        self.desc.setText(f"{c}  [{u if u else '-'}]\n{self.cat.description(c) or ''}")
+        unit = "unknown" if u is None else (u or "dimensionless")
+        self.desc.setText(f"{c}  [{unit}]\n{self.cat.description(c) or ''}")
 
     def _toggled(self, item, col):
         if self._guard:
             return
         c = item.text(0)
         on = item.checkState(0) == Qt.CheckState.Checked
+        if on and c not in self.plotted and len(self.plotted) >= self.limit:
+            self._guard = True
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            self._guard = False
+            self.desc.setText(f"Select up to {self.limit} channels.")
+            return
         if on and c not in self.plotted:
             self.plotted.append(c)
         elif not on and c in self.plotted:
@@ -310,17 +365,6 @@ class ChannelPicker(QtWidgets.QWidget):
         else:
             return
         self.changed.emit(list(self.plotted))
-
-    def sync(self, plotted):
-        self.plotted = list(plotted)
-        self._guard = True
-        for i in range(self.tree.topLevelItemCount()):
-            p = self.tree.topLevelItem(i)
-            for j in range(p.childCount()):
-                ch = p.child(j)
-                ch.setCheckState(0, Qt.CheckState.Checked if ch.text(0) in self.plotted
-                                 else Qt.CheckState.Unchecked)
-        self._guard = False
 
     def _filter(self, text):
         t = text.lower().strip()
