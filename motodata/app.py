@@ -5,7 +5,12 @@ cursor readout sit on the right. Laps are chosen in their own window (Ctrl+L).
 Data comes through motodata.reader / .lapdata / .discovery.
 """
 from __future__ import annotations
-import os, sys, ctypes, json, time
+
+import ctypes
+import os
+import sys
+import threading
+import time
 import numpy as np
 
 from PyQt6 import QtGui, QtWidgets
@@ -103,7 +108,7 @@ def mono(pt, weight=QtGui.QFont.Weight.Light):
 
 
 def fmt_val(name, v):
-    if v is None or v != v:
+    if v is None or not np.isfinite(v):
         return "--"
     return str(int(round(v))) if "gear" in name.lower() else f"{v:.1f}"
 
@@ -178,16 +183,29 @@ class Walk(QRunnable):
     def __init__(self, root, gen):
         super().__init__()
         self.root, self.gen, self.sig = root, gen, _WalkSig()
+        self._stop = threading.Event()
         self.finished = False
         self.setAutoDelete(False)          # Python side must outlive run()
 
+    def stop(self):
+        self._stop.set()
+
     def run(self):
+        cars = {}
+        warning = ""
         try:
-            cars = discovery.group_by_car(discovery.find_lap_dirs(self.root))
-        except Exception:
-            cars = {}
-        self.sig.result.emit(self.gen, cars)
-        self.finished = True
+            try:
+                laps = discovery.find_lap_dirs(self.root, cancelled=self._stop.is_set)
+                cars = discovery.group_by_car(laps)
+            except discovery.ScanLimitError as e:
+                laps, warning = e.laps, str(e)
+                cars = discovery.group_by_car(laps)
+            except OSError:
+                laps = []
+            if not self._stop.is_set():
+                self.sig.result.emit(self.gen, (cars, laps, warning))
+        finally:
+            self.finished = True
 
 
 class MotoData(QtWidgets.QMainWindow):
@@ -199,28 +217,34 @@ class MotoData(QtWidgets.QMainWindow):
         self.resize(1600, 950)
         self.setStyleSheet(STYLE)
         self.cat = Catalog()
-        self.pool = QThreadPool.globalInstance()
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
         self.hdr_cache = discovery.load_cache(HEADER_CACHE)
         self.meta_cache = {}
         self.cfg = self._load_cfg()
 
         self.root = ""
-        self.cars = {}
-        self.lap_rows = []
+        self._scan_count = 0
         self.scan = None
+        self._walk = None
         self.lapA = self.lapB = None
         self.showA = self.showB = True
         self.show_dt = True
         self.mode = "dist"
         self._m = "dist"
-        self.plotted = list(self.cfg.get("plotted") or [])
+        saved = self.cfg.get("plotted")
+        self._auto_channels = not isinstance(saved, list)
+        self.selected = [c for c in (saved or []) if isinstance(c, str)]
+        self.plotted = []
         self.cursor_x = 0.0
         self.panels = {}
         self.dt = None
         self.xref = None
         self._gen = self._walk_gen = 0
         self._jobs = []
-        self._auto_done = False
+        self._auto_select = False
+        self._scan_extra = False
+        self._scan_warning = ""
         self._focus = False
         self._xset = False
         self._read_rows = {}
@@ -230,10 +254,11 @@ class MotoData(QtWidgets.QMainWindow):
         self._tick.setSingleShot(True)
         self._tick.timeout.connect(self._flush_cursor)
 
-        self.laps_win = LapPicker(self.pool, self.hdr_cache, STYLE)
+        self.laps_win = LapPicker(STYLE)
         self.laps_win.assign.connect(self._assign)
         self.laps_win.unassign.connect(self._unassign)
-        self.chan_panel = ChannelPicker(self.cat)
+        self.laps_win.laps_requested.connect(self._request_laps)
+        self.chan_panel = ChannelPicker(self.cat, limit=MAX_PANELS)
         self.chan_panel.changed.connect(self._set_channels)
 
         self._build_ui()
@@ -291,11 +316,11 @@ class MotoData(QtWidgets.QMainWindow):
         b = QtWidgets.QPushButton("Laps…")
         b.clicked.connect(self.show_laps)
         btns.addWidget(b)
-        self.delta_btn = QtWidgets.QPushButton("Δ  --")
+        self.delta_btn = QtWidgets.QPushButton("Δ B−A  --")
         self.delta_btn.setCheckable(True)
         self.delta_btn.setChecked(True)
         self.delta_btn.setFont(mono(9))
-        self.delta_btn.setToolTip("show / hide the Δt panel (flips the x-axis to distance)")
+        self.delta_btn.setToolTip("show / hide Δt B − A (uses the distance axis)")
         self.delta_btn.clicked.connect(self._toggle_dt)
         btns.addWidget(self.delta_btn)
         h.addLayout(btns)
@@ -427,7 +452,7 @@ class MotoData(QtWidgets.QMainWindow):
 
         m = mb.addMenu("&Channels")
         m.addAction("Focus channel filter", "Ctrl+K", self.focus_channels)
-        m.addAction("Clear all", lambda: self._set_channels([]))
+        m.addAction("Clear all", self._clear_channels)
 
         m = mb.addMenu("&View")
         m.addAction("Time / Distance x-axis", "Z", self.toggle_mode)
@@ -437,20 +462,16 @@ class MotoData(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------- config
     def _load_cfg(self):
-        try:
-            return json.load(open(CONFIG, encoding="utf-8"))
-        except Exception:
-            return {}
+        return discovery.load_cache(CONFIG)
 
     def _save_cfg(self):
-        self.cfg["plotted"] = self.plotted
+        if self._auto_channels and not self.selected:
+            self.cfg.pop("plotted", None)
+        else:
+            self.cfg["plotted"] = self.selected
         if not self._focus:
             self.cfg["splitter_open"] = self.split.sizes()
-        try:
-            os.makedirs(STATE_DIR, exist_ok=True)
-            json.dump(self.cfg, open(CONFIG, "w", encoding="utf-8"))
-        except Exception:
-            pass
+        discovery.save_cache(CONFIG, self.cfg)
 
     # ------------------------------------------------------------ folders
     def show_laps(self):
@@ -477,25 +498,44 @@ class MotoData(QtWidgets.QMainWindow):
             self.open_folder(d)
 
     def open_folder(self, root):
+        if self._walk:
+            self._walk.stop()
+        if self.scan:
+            self.scan.stop()
+        self._auto_select = False
+        self._gen += 1
+        for lap in (self.lapA, self.lapB):
+            if lap:
+                lap.close()
+        self.lapA = self.lapB = None
+        self._after_lap_change()
+        self.laps_win.set_index([])
+        self.laps_win.set_laps([])
         self.root = root
         self.cfg["last_folder"] = root
         self.status.setText("Scanning folders…")
         self._walk_gen += 1
         w = Walk(root, self._walk_gen)
+        self._walk = w
         w.sig.result.connect(self._on_cars)
         self._start(w)
 
-    def _on_cars(self, gen, cars):
+    def _on_cars(self, gen, result):
         if gen != self._walk_gen:
             return
-        self.cars = cars
-        self.laps_win.set_root(self.root)
+        cars, laps, warning = result
+        self.laps_win.set_index(laps)
+        self.laps_win.set_root(self.root, refresh=True)
         if cars:
-            self.select_car(next(iter(cars)))
+            self._begin_scan(next(iter(cars.values())), auto_select=True,
+                             warning=warning)
         else:
-            self.status.setText("No laps found under that folder.")
+            self.status.setText(warning or "No laps found under that folder.")
 
-    def select_car(self, car):
+    def _request_laps(self, laps, extra):
+        self._begin_scan(laps, extra=extra)
+
+    def _begin_scan(self, laps, auto_select=False, extra=False, warning=""):
         if self.scan:
             self.scan.stop()
             try:
@@ -504,48 +544,55 @@ class MotoData(QtWidgets.QMainWindow):
             except TypeError:
                 pass
         self._gen += 1
-        self._auto_done = False
-        laps = self.cars.get(car, [])
-        self.lap_rows = [{"dir": d, "lt": None} for d in laps]
+        self._auto_select = auto_select
+        self._scan_extra = extra
+        self._scan_warning = warning
+        self._scan_count = len(laps)
         self.status.setText(f"{len(laps)} laps — reading times…")
-        self.laps_win.show_laps(laps)
-        self.scan = Scan(laps, self.hdr_cache, self._gen)
+        self.laps_win.set_laps(laps)
+        self.scan = Scan(laps, self.hdr_cache, self._gen, 2 if auto_select else 0)
         self.scan.sig.lap.connect(self._on_lap_meta)
         self.scan.sig.done.connect(self._on_scan_done)
         self._start(self.scan)
 
-    def _on_lap_meta(self, gen, i, meta):
-        if gen == self._gen and i < len(self.lap_rows):
-            self.lap_rows[i]["lt"] = meta[0]
-
-    def _on_scan_done(self, gen):
-        if gen != self._gen or self._auto_done:
+    def _on_lap_meta(self, gen, lap_dir, meta):
+        if gen != self._gen:
             return
-        self._auto_done = True
-        ts = [r["lt"] for r in self.lap_rows if r["lt"] and r["lt"] > 0]
-        med = float(np.median(ts)) if ts else None
-        cand = sorted((r["lt"], r["dir"]) for r in self.lap_rows
-                      if r["lt"] and r["lt"] > 0 and (med is None or r["lt"] >= 0.5 * med))
-        self.status.setText(f"{len(self.lap_rows)} laps")
-        if cand:
-            self._assign("A", cand[0][1])
-        if len(cand) > 1:
-            self._assign("B", cand[1][1])
+        self.laps_win.set_meta(lap_dir, meta)
+
+    def _on_scan_done(self, gen, selected):
+        if gen != self._gen:
+            return
+        self.laps_win.scan_finished(self._scan_extra)
+        self.status.setText(self._scan_warning or f"{self._scan_count} laps")
+        if not self._auto_select:
+            return
+        self._auto_select = False
+        if selected:
+            self._assign("A", selected[0], auto=True)
+        if len(selected) > 1:
+            self._assign("B", selected[1], auto=True)
 
     # --------------------------------------------------------------- laps
-    def _assign(self, slot, lap_dir):
+    def _assign(self, slot, lap_dir, auto=False):
+        if not auto:
+            self._auto_select = False
         cur = self.lapA if slot == "A" else self.lapB
         if cur and os.path.dirname(cur.ztx_path) == lap_dir:
             return
         ztx = discovery.ztx_in(lap_dir)
         if not ztx:
             self.status.setText("No .ztx in that lap folder.")
+            self.laps_win.set_slots(self._dir(self.lapA), self._dir(self.lapB))
             return
         try:
-            lt, _ = discovery.lap_meta(lap_dir, self.hdr_cache)
-            lap = LapData(ztx, lt, label=slot)
+            lt, _, dist = discovery.lap_header_meta(lap_dir, self.hdr_cache)
+            if lt is None or not np.isfinite(lt) or lt <= 0:
+                raise ValueError("invalid lap time")
+            lap = LapData(ztx, lt, label=slot, lap_distance=dist)
         except Exception as e:
             self.status.setText(f"Load failed: {e}")
+            self.laps_win.set_slots(self._dir(self.lapA), self._dir(self.lapB))
             return
         if slot == "A":
             if self.lapA:
@@ -559,14 +606,10 @@ class MotoData(QtWidgets.QMainWindow):
             self.lapB = lap
             self.showB = True
             self.btnB.setChecked(True)
-        if not self.plotted:
-            self.plotted = self._resolve_defaults(lap)
-            self.chan_panel.build(lap.channels, self.plotted)
-        elif not self.chan_panel.tree.topLevelItemCount():
-            self.chan_panel.build(lap.channels, self.plotted)
         self._after_lap_change()
 
     def _unassign(self, slot):
+        self._auto_select = False
         if slot == "B":
             self._clear_b()
         elif self.lapA:
@@ -587,7 +630,7 @@ class MotoData(QtWidgets.QMainWindow):
     def _toggle_dt(self):
         self.show_dt = self.delta_btn.isChecked()
         if self.show_dt and self.mode != "dist":
-            self.toggle_mode()      # Δt is time gained per metre; only the distance axis shows it
+            self.toggle_mode()
         else:
             self.render()
 
@@ -608,10 +651,20 @@ class MotoData(QtWidgets.QMainWindow):
         self._after_lap_change()
 
     def _after_lap_change(self):
+        self._tick.stop()
+        self._pending_x = None
+        self.cursor_x = 0.0
         self._sync_origin()
         self._compare_bar()
         self.laps_win.set_slots(self._dir(self.lapA), self._dir(self.lapB))
-        self.chan_panel.sync(self.plotted)
+        available = set()
+        for lap in (self.lapA, self.lapB):
+            if lap:
+                available.update(lap.channels)
+        if self._auto_channels:
+            self.selected = self._resolve_defaults(available)
+        self.plotted = [c for c in self.selected if c in available][:MAX_PANELS]
+        self.chan_panel.build(available, self.plotted)
         self.render()
 
     def _dir(self, lap):
@@ -630,14 +683,15 @@ class MotoData(QtWidgets.QMainWindow):
             return ""
         d = os.path.dirname(lap.ztx_path)
         txt = discovery.describe(d, self.meta_cache)
-        st = self.meta_cache.get("start:" + d, False)
-        if st is False:
+        header = self.hdr_cache.get(d)
+        if isinstance(header, dict) and "start" in header:
+            st = header["start"]
+        else:
             try:
                 from .reader import read_lap_header
                 st = read_lap_header(d).start
-            except Exception:
+            except (OSError, ValueError):
                 st = None
-            self.meta_cache["start:" + d] = st
         if st:
             txt += "  ·  " + time.strftime("%d %b %Y", time.localtime(st))
         return txt
@@ -649,21 +703,30 @@ class MotoData(QtWidgets.QMainWindow):
             btn.setEnabled(lap is not None)
             meta.setText(self._lap_meta_text(lap))
         both = self.lapA and self.lapB and self.lapA.lap_time and self.lapB.lap_time
-        self.delta_btn.setText(f"Δ {self.lapA.lap_time - self.lapB.lap_time:+.3f}"
-                               if both else "Δ  --")
+        self.delta_btn.setText(f"Δ B−A {self.lapB.lap_time - self.lapA.lap_time:+.3f}"
+                               if both else "Δ B−A  --")
 
     # ----------------------------------------------------------- channels
-    def _resolve_defaults(self, lap):
+    def _resolve_defaults(self, available):
         out = []
         for names in ROLE_CHANNELS.values():
             for n in names:
-                if lap.has(n):
+                if n in available:
                     out.append(n)
                     break
         return out
 
     def _set_channels(self, channels):
-        self.plotted = list(channels)[:MAX_PANELS]
+        self._auto_channels = False
+        self.selected = list(channels)[:MAX_PANELS]
+        self.plotted = list(self.selected)
+        self.render()
+
+    def _clear_channels(self):
+        self._auto_channels = False
+        self.selected, self.plotted = [], []
+        available = set().union(*(lap.channels for lap in (self.lapA, self.lapB) if lap))
+        self.chan_panel.build(available, [])
         self.render()
 
     # -------------------------------------------------------------- plots
@@ -695,7 +758,7 @@ class MotoData(QtWidgets.QMainWindow):
         old = self._eff_mode()
         self.mode = "time" if self.mode == "dist" else "dist"
         new = self._eff_mode()
-        ref = self.lapA or self.lapB
+        ref = self._ref()
         if ref and old != new and self.cursor_x:
             self.cursor_x = (ref.to_dist(self.cursor_x) if new == "dist"
                              else ref.to_time(self.cursor_x))
@@ -705,6 +768,10 @@ class MotoData(QtWidgets.QMainWindow):
 
     def render(self, autorange=False):
         self._m = self._eff_mode()
+        visible = {lap for lap in self._vis() if lap}
+        for lap in (self.lapA, self.lapB):
+            if lap:
+                lap.retain_channels(self.plotted if lap in visible else ())
         if self.mode == "dist" and self._m == "time":
             self.status.setText("Distance not available for a selected lap — showing time.")
         can = self._can_dt()
@@ -822,6 +889,7 @@ class MotoData(QtWidgets.QMainWindow):
     def _refresh(self):
         m = self._m
         a, b = self._vis()
+        bad = []
         for ch, pr in self.panels.items():
             solo = self.chan_color(ch)
             u = self.cat.unit(ch)[0]
@@ -834,6 +902,8 @@ class MotoData(QtWidgets.QMainWindow):
                     style = Qt.PenStyle.DashLine if (dash and not solo) else Qt.PenStyle.SolidLine
                     curve.setPen(pg.mkPen(col, width=1.6 if not dash else 1.3, style=style))
                     curve.setData(*lap.xy(ch, m))
+                    if lap.channel_error(ch):
+                        bad.append(f"{lap.label}:{ch}")
                 else:
                     curve.clear()
         if self.dt and a and b:
@@ -842,6 +912,10 @@ class MotoData(QtWidgets.QMainWindow):
             ta, tb = a.t_of_distance(dg), b.t_of_distance(dg)
             if ta is not None and tb is not None:
                 self.dtcurve.setData(dg, tb - ta)
+        if bad:
+            self.status.setText("Unreadable channel: " + ", ".join(bad))
+        elif self.status.text().startswith("Unreadable channel:"):
+            self.status.clear()
 
     def _limit_x(self, plots):
         """The lap is the whole x world: zoom and pan stop at 0..xmax."""
@@ -927,7 +1001,7 @@ class MotoData(QtWidgets.QMainWindow):
             if r:
                 r["a"].setText(fmt_val(ch, va) if a else "")
                 r["b"].setText(fmt_val(ch, vb) if b else "")
-                r["d"].setText(f"{va - vb:+.1f}" if (va is not None and vb is not None) else "")
+                r["d"].setText(f"{vb - va:+.1f}" if (va is not None and vb is not None) else "")
         for lap, dot in ((a, self.dotA), (b, self.dotB)):
             p = lap.gps_point(x, self._m) if lap else None
             dot.setData([p[0]], [p[1]]) if p else dot.setData([], [])
@@ -1013,11 +1087,19 @@ class MotoData(QtWidgets.QMainWindow):
             no_frame_border(int(self.winId()))
 
     def closeEvent(self, e):
+        self._walk_gen += 1
+        self._gen += 1
+        if self._walk:
+            self._walk.stop()
         if self.scan:
             self.scan.stop()
+        self.pool.clear()
         self.laps_win.close()
         self._save_cfg()
-        discovery.save_cache(HEADER_CACHE, dict(self.hdr_cache))
+        cache = dict(self.hdr_cache)
+        if self.pool.waitForDone(3000):
+            cache = dict(self.hdr_cache)
+        discovery.save_cache(HEADER_CACHE, cache)
         for lap in (self.lapA, self.lapB):
             if lap:
                 lap.close()
