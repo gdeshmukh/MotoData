@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from ctypes import wintypes
 import numpy as np
 
 from PyQt6 import QtGui, QtWidgets
@@ -45,6 +46,11 @@ CAPTION_CLICKS = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick)
 FONT = ("JetBrains Mono", "Cascadia Mono", "Consolas")   # first one installed wins
 FONT_CSS = ",".join(f"'{f}'" for f in FONT)
 DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE = 34, 0xFFFFFFFE
+WM_NCHITTEST = 0x0084
+HTLEFT, HTRIGHT, HTTOP = 10, 11, 12
+HTTOPLEFT, HTTOPRIGHT = 13, 14
+HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = 15, 16, 17
+RESIZE_MARGIN = 6
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".motodata")
 CONFIG = os.path.join(STATE_DIR, "config.json")
 HEADER_CACHE = os.path.join(STATE_DIR, "headers.json")
@@ -213,7 +219,8 @@ class MotoData(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("MotoData")                 # taskbar only; there is no title bar
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint
-                            | Qt.WindowType.WindowSystemMenuHint)
+                            | Qt.WindowType.WindowSystemMenuHint
+                            | Qt.WindowType.FramelessWindowHint)
         self.resize(1600, 950)
         self.setStyleSheet(STYLE)
         self.cat = Catalog()
@@ -431,6 +438,36 @@ class MotoData(QtWidgets.QMainWindow):
                 self.windowHandle().startSystemMove()
             return True
         return super().eventFilter(obj, ev)
+
+    def nativeEvent(self, event_type, message):
+        """Keep native edge/corner resize behaviour on the frameless window."""
+        if sys.platform == "win32" and not (self.isMaximized() or self.isFullScreen()):
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+            except (TypeError, ValueError):
+                return False, 0
+            if msg.message == WM_NCHITTEST:
+                pos = self.mapFromGlobal(QtGui.QCursor.pos())
+                left, right = pos.x() < RESIZE_MARGIN, pos.x() >= self.width() - RESIZE_MARGIN
+                top, bottom = pos.y() < RESIZE_MARGIN, pos.y() >= self.height() - RESIZE_MARGIN
+                if top and left:
+                    return True, HTTOPLEFT
+                if top and right:
+                    return True, HTTOPRIGHT
+                if bottom and left:
+                    return True, HTBOTTOMLEFT
+                if bottom and right:
+                    return True, HTBOTTOMRIGHT
+                if left:
+                    return True, HTLEFT
+                if right:
+                    return True, HTRIGHT
+                if top:
+                    return True, HTTOP
+                if bottom:
+                    return True, HTBOTTOM
+        # Calling QMainWindow.nativeEvent here access-violates in PyQt6.
+        return False, 0
 
     def _build_menu(self):
         mb = self.menuBar()
