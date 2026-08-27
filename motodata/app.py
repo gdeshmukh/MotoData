@@ -221,7 +221,11 @@ class MotoData(QtWidgets.QMainWindow):
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint
                             | Qt.WindowType.WindowSystemMenuHint
                             | Qt.WindowType.FramelessWindowHint)
-        self.resize(1600, 950)
+        # restore-down rect: 1600x950 unless the screen is smaller (it was opening
+        # bigger than a scaled laptop display, cut off and passing for full screen)
+        avail = self.screen().availableGeometry()
+        self.resize(min(1600, avail.width() * 9 // 10), min(950, avail.height() * 9 // 10))
+        self.move(avail.center() - self.rect().center())
         self.setStyleSheet(STYLE)
         self.cat = Catalog()
         self.pool = QThreadPool(self)
@@ -1148,7 +1152,8 @@ def main():
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QtWidgets.QApplication(sys.argv)
     win = MotoData(sys.argv[1] if len(sys.argv) > 1 else "")
-    win.show()
+    win.show()          # must precede the maximize, or Windows records no restore rect
+    win.showMaximized()
     sys.exit(app.exec())
 
 
