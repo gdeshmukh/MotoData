@@ -365,6 +365,9 @@ class MotoData(QtWidgets.QMainWindow):
         b = QtWidgets.QPushButton("PNG")
         b.clicked.connect(self.save_png)
         bot.addWidget(b)
+        b = QtWidgets.QPushButton("CSV")
+        b.clicked.connect(self.save_csv)
+        bot.addWidget(b)
         right.addLayout(bot)
         h.addLayout(right)
         v.addWidget(bar)
@@ -480,6 +483,7 @@ class MotoData(QtWidgets.QMainWindow):
         m = mb.addMenu("&File")
         m.addAction("Open folder…", "Ctrl+O", self.open_folder_dialog)
         m.addAction("Save graph as PNG…", self.save_png)
+        m.addAction("Save data as CSV…", self.save_csv)
         m.addSeparator()
         m.addAction("Exit", self.close)
 
@@ -1117,6 +1121,32 @@ class MotoData(QtWidgets.QMainWindow):
         finally:
             for o in overlays:
                 o.setVisible(True)
+
+    def save_csv(self):
+        lap = self._ref()
+        if not lap:
+            return
+        series = [(ch, *lap.xy(ch, "time")) for ch in self.plotted if lap.has(ch)]
+        series = [s for s in series if len(s[1])]
+        if not series:
+            return
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV (*.csv)")
+        if not f:
+            return
+        if not f.lower().endswith(".csv"):
+            f += ".csv"
+        base = max(series, key=lambda s: lap.rate(s[0]))  # densest channel sets the row grid
+        t = base[1]
+        names, cols = ["Time [s]"], [t]
+        if lap.has_distance:
+            names.append("Distance [m]")
+            cols.append(lap.x(base[0], "dist"))
+        for ch, ct, cv in series:
+            names.append(self.cat.label(ch))
+            cols.append(np.interp(t, ct, cv))
+        np.savetxt(f, np.column_stack(cols), fmt="%.9g", delimiter=",",
+                   header=",".join(names), comments="")
+        self.status.setText(f"Saved {f}")
 
     def showEvent(self, e):
         super().showEvent(e)

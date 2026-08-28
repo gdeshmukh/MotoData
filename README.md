@@ -35,7 +35,8 @@ and a Ferrari export open through the same reader.
   to that point on track.
 - **Channel picker** (`Ctrl+K`) — filter ~700 channels by name *or* description,
   grouped by module; your selection persists as you switch laps.
-- **Time / Distance x-axis**, **focus mode** (hide the side panel), PNG export.
+- **Time / Distance x-axis**, **focus mode** (hide the side panel), PNG export,
+  and CSV export of time, distance and the plotted channels.
 
 ## Requirements
 - Python 3.10+
