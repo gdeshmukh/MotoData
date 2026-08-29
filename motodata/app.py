@@ -33,12 +33,14 @@ EDGE = "#39424e"        # panel divider
 CHAN_COLORS = ["#37d3d0", "#f2b03d", "#a98bff", "#4d9dff", "#ff77b0", "#9ada5a",
                "#ff8a3c", "#7ee6a0", "#e0e0e0", "#ffd166", "#8ec7ff", "#c3a6ff"]
 
+# WinTAX names first, then Bosch WinDarab (.bmsbin) equivalents.
 ROLE_CHANNELS = {
-    "speed":    ["vCar", "CarSpd_vCar", "GPS_CarSpeed"],
-    "throttle": ["rPedal", "rThrottle1"],
-    "brake":    ["pBrakeMCF", "pBrakeMCR"],
-    "gear":     ["nGear", "GBX_NGearLeverOut"],
-    "steer":    ["EPS_aSteering", "aSteer"],
+    "speed":    ["vCar", "CarSpd_vCar", "GPS_CarSpeed",
+                 "gps_speed", "speed_vwheel_can_fr_fer", "canfed_vwheel_fl_fer"],
+    "throttle": ["rPedal", "rThrottle1", "aps_fer", "etc_ath_fer"],
+    "brake":    ["pBrakeMCF", "pBrakeMCR", "pbrake_f_fer", "pbrake_r_fer"],
+    "gear":     ["nGear", "GBX_NGearLeverOut", "gear"],
+    "steer":    ["EPS_aSteering", "aSteer", "steer_fer"],
 }
 MAX_PANELS = 12
 FRAME_MS = 0.016
@@ -179,6 +181,31 @@ class MapViewBox(pg.ViewBox):
 
     def mouseClickEvent(self, ev):
         self._emit(ev)
+
+
+class _MapSig(QObject):
+    done = pyqtSignal(object)               # map dict | Exception
+
+
+class MapBuild(QRunnable):
+    """Build a .bmsbin channel map from a WinDarab export off the UI thread
+    (parsing the export takes ~20-30 s). Writes the ``<file>.map.json`` sidecar."""
+
+    def __init__(self, bmsbin, export):
+        super().__init__()
+        self.bmsbin, self.export, self.sig = bmsbin, export, _MapSig()
+        self.finished = False
+        self.setAutoDelete(False)
+
+    def run(self):
+        try:
+            from .windarab import build_map
+            result = build_map(self.bmsbin, self.export)
+        except Exception as e:                          # surfaced to the user
+            result = e
+        finally:
+            self.finished = True
+        self.sig.done.emit(result)
 
 
 class _WalkSig(QObject):
@@ -482,6 +509,7 @@ class MotoData(QtWidgets.QMainWindow):
         mb.installEventFilter(self)
         m = mb.addMenu("&File")
         m.addAction("Open folder…", "Ctrl+O", self.open_folder_dialog)
+        m.addAction("Open WinDarab .bmsbin…", self.open_bmsbin_dialog)
         m.addAction("Save graph as PNG…", self.save_png)
         m.addAction("Save data as CSV…", self.save_csv)
         m.addSeparator()
@@ -541,6 +569,50 @@ class MotoData(QtWidgets.QMainWindow):
             self, "Select a WinTAX data / session / car folder", self.cfg.get("last_folder", ""))
         if d:
             self.open_folder(d)
+
+    # ------------------------------------------------------ WinDarab .bmsbin
+    def open_bmsbin_dialog(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open WinDarab .bmsbin", self.cfg.get("last_bmsbin", ""),
+            "WinDarab data (*.bmsbin)")
+        if f:
+            self.cfg["last_bmsbin"] = f
+            self.open_bmsbin(f)
+
+    def open_bmsbin(self, path, slot="A"):
+        """Open a .bmsbin into a slot. Channels are named from a cached map; if none
+        exists yet, ask for the WinDarab text export of this file to build one."""
+        from .windarab import map_path
+        if os.path.isfile(map_path(path)):
+            self._open_bmsbin_lap(path, slot)
+            return
+        export, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select the WinDarab text export of this file (one-time, to name channels)",
+            os.path.dirname(path), "WinDarab export (*.txt);;All files (*)")
+        if not export:
+            self.status.setText("A WinDarab text export is needed to name the channels.")
+            return
+        self.status.setText("Building channel map from export… (one-time, ~30 s)")
+        job = MapBuild(path, export)
+        job.sig.done.connect(lambda r: self._on_map_built(path, r, slot))
+        self._start(job)
+
+    def _on_map_built(self, path, result, slot):
+        if isinstance(result, Exception):
+            self.status.setText(f"Map build failed: {result}")
+            return
+        self.status.setText(f"Channel map built ({len(result['channels'])} channels).")
+        self._open_bmsbin_lap(path, slot)
+
+    def _open_bmsbin_lap(self, path, slot):
+        try:
+            lap = LapData(path, label=slot)
+        except Exception as e:
+            self.status.setText(f"Load failed: {e}")
+            return
+        if hasattr(lap.lap, "units"):          # let the catalog label Bosch panels
+            self.cat.hints.update(lap.lap.units())
+        self._set_lap(slot, lap)
 
     def open_folder(self, root):
         if self._walk:
@@ -623,7 +695,7 @@ class MotoData(QtWidgets.QMainWindow):
         if not auto:
             self._auto_select = False
         cur = self.lapA if slot == "A" else self.lapB
-        if cur and os.path.dirname(cur.ztx_path) == lap_dir:
+        if cur and os.path.dirname(cur.source) == lap_dir:
             return
         ztx = discovery.ztx_in(lap_dir)
         if not ztx:
@@ -639,6 +711,9 @@ class MotoData(QtWidgets.QMainWindow):
             self.status.setText(f"Load failed: {e}")
             self.laps_win.set_slots(self._dir(self.lapA), self._dir(self.lapB))
             return
+        self._set_lap(slot, lap)
+
+    def _set_lap(self, slot, lap):
         if slot == "A":
             if self.lapA:
                 self.lapA.close()
@@ -713,7 +788,7 @@ class MotoData(QtWidgets.QMainWindow):
         self.render()
 
     def _dir(self, lap):
-        return os.path.dirname(lap.ztx_path) if lap else None
+        return os.path.dirname(lap.source) if lap else None
 
     def _sync_origin(self):
         ref = self.lapA or self.lapB
@@ -726,7 +801,7 @@ class MotoData(QtWidgets.QMainWindow):
     def _lap_meta_text(self, lap):
         if not lap:
             return ""
-        d = os.path.dirname(lap.ztx_path)
+        d = os.path.dirname(lap.source)
         txt = discovery.describe(d, self.meta_cache)
         header = self.hdr_cache.get(d)
         if isinstance(header, dict) and "start" in header:

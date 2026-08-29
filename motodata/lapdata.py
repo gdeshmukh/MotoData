@@ -13,10 +13,20 @@ import numpy as np
 
 from .reader import Lap, SPEED_CHANNELS
 
-DIST_CHANNELS = ("sLap", "In_xDistanceLap")
+DIST_CHANNELS = ("sLap", "In_xDistanceLap", "lap_dist_fer", "xdist", "gps_dist")
 GPS_LAT, GPS_LON = "GPS_Latitude", "GPS_Longitude"
 _EARTH_R = 6371000.0
 _DEG = np.pi / 180.0
+
+
+def open_lap(source: str, lap_time: float | None = None,
+             lap_distance: float | None = None):
+    """Open a lap by its source path, picking the backend by file type: a Bosch
+    WinDarab ``.bmsbin`` (with its cached ``.map.json``) or a WinTAX ``.ztx``."""
+    if source.lower().endswith(".bmsbin"):
+        from .windarab import DarabLap
+        return DarabLap(source, lap_time=lap_time, lap_distance=lap_distance)
+    return Lap(source, lap_time, lap_distance)
 
 
 def _distance_axis(v: np.ndarray, lap_length: float | None = None) -> np.ndarray:
@@ -40,11 +50,11 @@ def _distance_axis(v: np.ndarray, lap_length: float | None = None) -> np.ndarray
 
 
 class LapData:
-    def __init__(self, ztx_path: str, lap_time: float | None = None,
+    def __init__(self, source: str, lap_time: float | None = None,
                  label: str = "", *, lap_distance: float | None = None):
-        self.ztx_path = ztx_path
+        self.source = source
         self.label = label
-        self.lap = Lap(ztx_path, lap_time, lap_distance)
+        self.lap = open_lap(source, lap_time, lap_distance)
         self.lap_time = self.lap.lap_time
         self.channels = set(self.lap.channels())
         self._cache: dict[str, tuple] = {}

@@ -30,7 +30,10 @@ from dataclasses import dataclass
 import numpy as np
 
 STD_RATES = (0.5, 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000)
-SPEED_CHANNELS = ("vCar", "CarSpd_vCar", "GPS_CarSpeed")
+# WinTAX names first, then Bosch WinDarab (.bmsbin) equivalents.
+SPEED_CHANNELS = ("vCar", "CarSpd_vCar", "GPS_CarSpeed",
+                  "gps_speed", "canfed_gps_speed_fer", "speed_vwheel_can_fr_fer",
+                  "canfed_vwheel_fl_fer", "canfed_vwheel_fr_fer")
 
 
 def _field(txt: str, tag: str):
