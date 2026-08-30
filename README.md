@@ -10,6 +10,11 @@ Built for post-session analysis: open a folder, scroll the laps, compare two.
 Reads WinTAX-family `.ztx` archives; it's car-agnostic, so a Toyota GR Supra GT4
 and a Ferrari export open through the same reader.
 
+Bosch WinDarab `.bmsbin` files open too (File → Open WinDarab .bmsbin…). Samples
+decode natively, but the format keeps its channel catalog encrypted, so naming
+them takes a one-time WinDarab text export of each file — matched automatically
+and cached beside it as `<file>.map.json`.
+
 ---
 
 ## Features
@@ -83,6 +88,7 @@ MotoData/
     ├── app.py                # main window: graph stack, track map, menus
     ├── pickers.py            # lap chooser (tree + A/B rows) and channel chooser
     ├── reader.py             # session-file parser (.ztx / .sar -> numpy)
+    ├── windarab.py           # Bosch WinDarab .bmsbin reader + channel-map builder
     ├── lapdata.py            # per-lap analysis (time/distance x, GPS, delta-t)
     ├── discovery.py          # folder scan, session metadata, lap-header cache
     └── catalog.py            # unit inference + channel descriptions

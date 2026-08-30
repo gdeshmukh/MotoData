@@ -96,6 +96,7 @@ class Catalog:
     def __init__(self):
         self.desc = _load_map(DESC_FILE)
         self.overrides = _load_map(OVERRIDE_FILE)
+        self.hints: dict[str, str] = {}   # units from the open lap's map, not persisted
 
     def description(self, name: str) -> str:
         return self.desc.get(name, "")
@@ -104,6 +105,8 @@ class Catalog:
         """Return (unit, source). unit is '' for dimensionless, None if unknown."""
         if name in self.overrides:
             return self.overrides[name], "override"
+        if name in self.hints:
+            return self.hints[name], "lap"
         return infer_unit_from(name, self.desc.get(name))
 
     def set_unit(self, name: str, unit: str):

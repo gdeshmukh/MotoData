@@ -3,9 +3,11 @@
     .venv\\Scripts\\python tests\\make_laps.py    (once)
     .venv\\Scripts\\python tests\\smoke.py
 """
+import json
 import sys
 from PyQt6 import QtGui, QtWidgets
 from ui import expected, launch
+from make_laps import BMSBIN, BMSBIN_JSON
 from motodata import app as A
 
 DMAX = max(e["dist"] for e in expected().values())
@@ -43,6 +45,20 @@ checks = {
 win.delta_btn.click()
 qapp.processEvents()
 checks["delta button brings it back"] = win.dt is not None
+
+# WinDarab .bmsbin reader path: open the synthetic file (its .map.json exists, so no
+# export prompt) into slot A and confirm channels are named and decode by construction.
+bm = json.load(open(BMSBIN_JSON, encoding="utf-8"))
+win.open_bmsbin(BMSBIN, "A")
+qapp.processEvents()
+la = win.lapA
+gear = la.ty("gear")[1]
+checks["bmsbin loads with named Bosch channels"] = set(bm["channels"]) <= la.channels
+checks["bmsbin lap time / distance from the map"] = (
+    abs(la.lap_time - bm["lap_time"]) < 1e-6 and abs(la.dist_max() - bm["dist"]) < 5)
+checks["bmsbin channels decode exactly"] = (
+    len(gear) == bm["n_gear"] and abs(gear[0] - bm["gear0"]) < 1e-9
+    and abs(la.ty("gps_speed")[1][0] - bm["speed0"]) < 1e-6)
 win.close()
 
 for label, ok in checks.items():
